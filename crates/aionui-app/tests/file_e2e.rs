@@ -2,6 +2,7 @@
 
 mod common;
 
+use aionui_common::constants::UPLOAD_MAX_SIZE;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use serde_json::json;
@@ -913,17 +914,22 @@ async fn upload_missing_file_field_returns_400() {
 }
 
 #[tokio::test]
-async fn upload_body_exceeding_30mb_returns_413() {
+async fn upload_body_declared_above_transport_limit_returns_413() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    // 31 MB payload comfortably exceeds UPLOAD_MAX_SIZE (30 MB).
-    let big = vec![0u8; 31 * 1024 * 1024];
+    // Reject from the declared length without allocating a 128 MiB test body.
+    // The small-file success case above exercises normal multipart persistence.
+    let big = vec![0u8; 1];
     let (content_type, body) = UploadMultipart::new()
         .add_file("file", "big.bin", "application/octet-stream", &big)
         .build();
 
-    let req = upload_request(&content_type, body, &token, &csrf);
+    let mut req = upload_request(&content_type, body, &token, &csrf);
+    req.headers_mut().insert(
+        "content-length",
+        axum::http::HeaderValue::from_str(&(UPLOAD_MAX_SIZE + 1).to_string()).unwrap(),
+    );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let json = body_json(resp).await;
