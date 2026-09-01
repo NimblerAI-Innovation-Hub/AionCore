@@ -918,7 +918,7 @@ async fn upload_body_declared_above_transport_limit_returns_413() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
 
-    // Reject from the declared length without allocating a 128 MiB test body.
+    // Reject from the declared length without allocating a 512 MiB test body.
     // The small-file success case above exercises normal multipart persistence.
     let big = vec![0u8; 1];
     let (content_type, body) = UploadMultipart::new()

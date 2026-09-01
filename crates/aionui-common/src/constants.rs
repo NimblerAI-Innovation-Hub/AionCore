@@ -25,12 +25,12 @@ pub const REMOTE_HOST: &str = "0.0.0.0";
 pub const DEFAULT_PORT: u16 = 25808;
 /// Request body size limit (10 MB).
 pub const BODY_LIMIT: usize = 10 * 1024 * 1024;
-/// File upload transport limit (128 MiB).
+/// File upload transport limit (512 MiB).
 ///
-/// The UI applies the user-facing 100 MiB file limit. The wider HTTP ceiling
+/// The UI applies the user-facing 256 MiB file limit. The wider HTTP ceiling
 /// leaves room for multipart headers and form fields without rejecting a file
 /// that is exactly at the advertised boundary.
-pub const UPLOAD_MAX_SIZE: usize = 128 * 1024 * 1024;
+pub const UPLOAD_MAX_SIZE: usize = 512 * 1024 * 1024;
 
 // --- Team mode ---
 

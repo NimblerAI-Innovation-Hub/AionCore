@@ -103,7 +103,7 @@ pub struct FileRouterState {
 ///
 /// All routes require authentication (applied by the caller).
 pub fn file_routes(state: FileRouterState) -> Router {
-    // Upload route carries its own body-size limit (UPLOAD_MAX_SIZE, 128 MiB).
+    // Upload route carries its own body-size limit (UPLOAD_MAX_SIZE, 512 MiB).
     // We first disable the global `DefaultBodyLimit` that `aionui-app`
     // installs (otherwise the `Multipart` extractor would cap the body at
     // `BODY_LIMIT`), then apply `RequestBodyLimitLayer` as the sole hard
