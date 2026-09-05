@@ -169,6 +169,7 @@ async fn router_with_dispatcher(dispatcher: Arc<FakeDispatcher>) -> axum::Router
     std::mem::forget(tmp);
 
     let state = SkillRouterState {
+        session_messages_enabled: true,
         skill_paths: paths,
         skill_repo,
         external_paths_manager: ext_mgr,

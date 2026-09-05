@@ -82,6 +82,7 @@ pub struct AppServices {
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
     /// User skill metadata and import history repository.
     pub skill_repo: Arc<dyn ISkillRepository>,
+    pub(crate) runtime_features: crate::config::RuntimeFeaturePolicy,
     backend_binary_path: Arc<PathBuf>,
     runtime_helper_bin: String,
     runtime_base_url: String,
@@ -120,6 +121,7 @@ impl AppServices {
     pub fn with_worker_task_manager(mut self, wtm: Arc<dyn IWorkerTaskManager>) -> Self {
         self.worker_task_manager = wtm;
         self.conversation_service = build_conversation_service(ConversationServiceDeps {
+            runtime_features: self.runtime_features,
             database: &self.database,
             work_dir: self.work_dir.clone(),
             event_bus: self.event_bus.clone(),
@@ -161,6 +163,13 @@ impl AppServices {
         // plain drive-letter form whenever the path is representable without
         // the prefix.
         let backend_binary_path = dunce::canonicalize(&backend_binary_path).unwrap_or(backend_binary_path);
+        let runtime_features = crate::config::RuntimeFeaturePolicy::from_env()?;
+        tracing::info!(
+            session_messages = runtime_features.session_messages,
+            midturn_delivery = runtime_features.midturn_delivery,
+            runtime_user_auth = runtime_features.runtime_user_auth,
+            "runtime feature policy applied"
+        );
         let data_dir = config.data_dir.clone();
         let work_dir = config.work_dir.clone();
         let identity_mode = config.effective_identity_mode();
@@ -390,6 +399,7 @@ impl AppServices {
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
         let conversation_service = build_conversation_service(ConversationServiceDeps {
+            runtime_features,
             database: &database,
             work_dir: work_dir.clone(),
             event_bus: event_bus.clone(),
@@ -408,16 +418,19 @@ impl AppServices {
 
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
         let session_message_notify = Arc::new(Notify::new());
-        let session_message_service = Arc::new(SessionMessageService::new(SessionMessageDeps {
-            conversation_service: conversation_service.clone(),
-            conversation_repo: conversation_repo.clone(),
-            settings_repo: Arc::new(SqliteSettingsRepository::new(database.pool().clone())),
-            task_manager: worker_task_manager.clone(),
-            broadcaster: event_bus.clone(),
-            queue: session_message_queue.clone(),
-            rate_limiter: Arc::new(RateLimiter::new(Arc::new(SystemClock))),
-            notify: session_message_notify.clone(),
-        }));
+        let session_message_service = Arc::new(
+            SessionMessageService::new(SessionMessageDeps {
+                conversation_service: conversation_service.clone(),
+                conversation_repo: conversation_repo.clone(),
+                settings_repo: Arc::new(SqliteSettingsRepository::new(database.pool().clone())),
+                task_manager: worker_task_manager.clone(),
+                broadcaster: event_bus.clone(),
+                queue: session_message_queue.clone(),
+                rate_limiter: Arc::new(RateLimiter::new(Arc::new(SystemClock))),
+                notify: session_message_notify.clone(),
+            })
+            .with_server_enabled(runtime_features.session_messages),
+        );
         // Cancel ⇒ clear the deliveries queued for that conversation. Injected
         // rather than called directly because the queue lives in an upper-layer
         // crate (see `OnConversationTurnCancelled`).
@@ -425,6 +438,7 @@ impl AppServices {
             .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(session_message_queue.clone())));
 
         Ok(Self {
+            runtime_features,
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
             antigravity_hook_tokens,
@@ -465,6 +479,7 @@ impl AppServices {
 }
 
 struct ConversationServiceDeps<'a> {
+    runtime_features: crate::config::RuntimeFeaturePolicy,
     database: &'a Database,
     work_dir: PathBuf,
     event_bus: Arc<BroadcastEventBus>,
@@ -485,10 +500,10 @@ struct ConversationServiceDeps<'a> {
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
-    let skill_resolver = Arc::new(aionui_conversation::skill_resolver::ExtensionSkillResolver::new(
-        deps.skill_paths,
-        deps.skill_repo,
-    ));
+    let skill_resolver = Arc::new(
+        aionui_conversation::skill_resolver::ExtensionSkillResolver::new(deps.skill_paths, deps.skill_repo)
+            .with_session_messages_enabled(deps.runtime_features.session_messages),
+    );
     let service = ConversationService::new(
         deps.work_dir,
         deps.event_bus,
@@ -498,6 +513,7 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAgentMetadataRepository::new(deps.database.pool().clone())),
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
+    .with_midturn_delivery_enabled(deps.runtime_features.midturn_delivery)
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
     .with_runtime_token_service(deps.runtime_token_service);

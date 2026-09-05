@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::middleware::Next;
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 
 use aionui_common::ApiError;
 use aionui_db::{IUserRepository, UserStatus, UserType};
@@ -36,6 +36,11 @@ pub const RUNTIME_CONVERSATION_ID_HEADER: &str = "x-aionui-conversation-id";
 /// token bound to exactly this (user_id, conversation_id) pair.
 pub trait IRuntimeTokenVerifier: Send + Sync {
     fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool;
+
+    /// Restrict which user API routes a verified conversation helper may call.
+    fn allows_request(&self, _method: &str, _path: &str, _conversation_id: &str) -> bool {
+        true
+    }
 }
 
 /// Authenticated user injected into request extensions by the auth middleware.
@@ -88,7 +93,24 @@ pub struct AuthState {
 /// Returns HTTP 401 for authentication failures.
 ///
 /// Use with `axum::middleware::from_fn_with_state`.
-pub async fn auth_middleware(
+pub async fn auth_middleware(state: State<AuthState>, request: Request, next: Next) -> Response {
+    match authenticate_then_run(state, request, next).await {
+        Ok(response) => response,
+        Err(error) => {
+            let mut response = error.into_response();
+            // Only this pre-handler boundary can grant safe request replay.
+            // A handler's own 401 does not receive this marker.
+            if response.status() == StatusCode::UNAUTHORIZED {
+                response
+                    .headers_mut()
+                    .insert("x-aionui-auth-rejected", HeaderValue::from_static("1"));
+            }
+            response
+        }
+    }
+}
+
+async fn authenticate_then_run(
     State(state): State<AuthState>,
     mut request: Request,
     next: Next,
@@ -171,7 +193,9 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         return Err(ApiError::Unauthorized("Authentication required".into()));
     };
 
-    if !verifier.verify_conversation_helper(&token, &user_id, &conversation_id) {
+    if !verifier.verify_conversation_helper(&token, &user_id, &conversation_id)
+        || !verifier.allows_request(request.method().as_str(), request.uri().path(), &conversation_id)
+    {
         return Err(ApiError::Unauthorized("Invalid runtime token".into()));
     }
 

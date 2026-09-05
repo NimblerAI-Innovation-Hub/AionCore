@@ -75,6 +75,7 @@ async fn fixture_embedded() -> Fixture {
     let ext_paths_mgr = Arc::new(ExternalPathsManager::with_file(data_dir.join("paths.json")).await);
     let skill_repo = Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone()));
     states.skill = SkillRouterState {
+        session_messages_enabled: true,
         skill_paths,
         skill_repo: skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,

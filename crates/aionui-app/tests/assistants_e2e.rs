@@ -269,6 +269,7 @@ async fn fixture() -> Fixture {
         assistant_skills_dir: user_data_dir.join("assistant-skills"),
     };
     states.skill = SkillRouterState {
+        session_messages_enabled: true,
         skill_paths,
         skill_repo: std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone())),
         external_paths_manager: ext_paths_mgr,

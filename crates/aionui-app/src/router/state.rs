@@ -1132,6 +1132,7 @@ pub async fn build_extension_states(
     };
 
     let skill_state = SkillRouterState {
+        session_messages_enabled: services.runtime_features.session_messages,
         skill_paths: services.skill_paths.as_ref().clone(),
         skill_repo: services.skill_repo.clone(),
         external_paths_manager: ext_paths_mgr,

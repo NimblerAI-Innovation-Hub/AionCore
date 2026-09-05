@@ -313,6 +313,7 @@ fn reject_deprecated_runtime_row(row: &ConversationRow) -> Result<(), Conversati
 #[derive(Clone)]
 pub struct ConversationService {
     workspace_root: PathBuf,
+    midturn_delivery_enabled: bool,
     broadcaster: Arc<dyn EventBroadcaster>,
     skill_resolver: Arc<dyn SkillResolver>,
     task_manager: Arc<dyn IWorkerTaskManager>,
@@ -404,6 +405,7 @@ impl ConversationService {
         acp_session_repo: Arc<dyn IAcpSessionRepository>,
     ) -> Self {
         Self {
+            midturn_delivery_enabled: true,
             workspace_root,
             broadcaster,
             skill_resolver,
@@ -427,6 +429,12 @@ impl ConversationService {
             agent_metadata_repo,
             acp_session_repo,
         }
+    }
+
+    /// Preserve the existing busy/queue contract when mid-turn delivery is disabled.
+    pub fn with_midturn_delivery_enabled(mut self, enabled: bool) -> Self {
+        self.midturn_delivery_enabled = enabled;
+        self
     }
 
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
@@ -814,10 +822,11 @@ impl ConversationService {
         // hardcoding false here made a fresh (pre-ensure) or dormant claude
         // conversation report false, so the frontend hydrate fetch raced the
         // send accept and gated the whole first turn into the queue panel.
-        let supports_midturn_delivery = match agent.as_ref() {
-            Some(agent) => agent.supports_midturn_delivery(),
-            None => self.static_supports_midturn_delivery(conversation_id).await,
-        };
+        let supports_midturn_delivery = self.midturn_delivery_enabled
+            && match agent.as_ref() {
+                Some(agent) => agent.supports_midturn_delivery(),
+                None => self.static_supports_midturn_delivery(conversation_id).await,
+            };
 
         self.runtime_state.summary_from_parts(
             conversation_id,
@@ -3873,6 +3882,7 @@ impl ConversationService {
         let mut fallback_user_msg: Option<String> = None;
         if let Some(active_turn_id) = self.runtime_state.active_turn_id_for(conversation_id)
             && let Some(agent) = task_manager.get_task(conversation_id)
+            && self.midturn_delivery_enabled
             && agent.supports_midturn_delivery()
         {
             // §4.6: a turn blocked on a permission confirmation / question card

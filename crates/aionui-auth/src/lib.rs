@@ -11,6 +11,7 @@ pub mod middleware;
 mod password;
 pub mod qr_token;
 mod rate_limit;
+mod read_rate_limit;
 mod routes;
 mod secret;
 mod security;
@@ -41,6 +42,8 @@ pub use password::{
 
 // Validation
 pub use validation::{validate_password, validate_username};
+
+pub use read_rate_limit::{IdentityReadLimits, ReadRatePolicy};
 
 // Rate limiting
 pub use rate_limit::{

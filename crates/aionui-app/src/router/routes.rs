@@ -269,9 +269,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
         identity_mode: auth_identity_mode(services.identity_mode),
+        // A scoped skill-read token must not implicitly become a browser/user
+        // credential in deployments with an external authorization gateway.
         runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
             runtime_token_service: services.runtime_token_service.clone(),
-        })),
+            allow_user_api: services.runtime_features.runtime_user_auth,
+        }) as Arc<dyn IRuntimeTokenVerifier>),
     };
 
     // System routes protected by auth middleware
@@ -508,9 +511,16 @@ impl SystemDefaultFilesystemAdopter for SkillFilesystemAdopter {
 /// aionui-ai-agent, so the binding happens here in the composition layer).
 struct ConversationHelperTokenVerifier {
     runtime_token_service: Arc<RuntimeTokenService>,
+    allow_user_api: bool,
 }
 
 impl IRuntimeTokenVerifier for ConversationHelperTokenVerifier {
+    fn allows_request(&self, method: &str, path: &str, conversation_id: &str) -> bool {
+        // AssetLens MCP resolves its Project binding through this exact read.
+        // Matching the token-bound id also excludes nested routes and writes.
+        self.allow_user_api || (method == "GET" && path.strip_prefix("/api/conversations/") == Some(conversation_id))
+    }
+
     fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool {
         self.runtime_token_service
             .validate(
@@ -688,5 +698,74 @@ mod tests {
 
         assert_eq!(delivered["data"]["sequence"], 4);
         bridge.abort();
+    }
+    #[tokio::test]
+    async fn deployment_can_restrict_helper_tokens_to_scoped_runtime_reads() {
+        use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            data_dir: dir.path().join("data"),
+            work_dir: dir.path().join("work"),
+            ..Default::default()
+        };
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let mut services = AppServices::from_config(db, &config).await.unwrap();
+        services.runtime_features.runtime_user_auth = false;
+        let app = crate::create_router(&services).await.unwrap();
+        let issue = services.runtime_token_service.issue(
+            "system_default_user",
+            "scoped-fixture",
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::ConversationHelper],
+        );
+        let request = |method, path, conversation_id| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("x-aionui-user-id", "system_default_user")
+                .header("x-aionui-conversation-id", conversation_id)
+                .header("x-aionui-runtime-token", &issue.token)
+                .body(Body::empty())
+                .unwrap()
+        };
+        for (method, path) in [
+            ("GET", "/api/conversations"),
+            ("GET", "/api/skills"),
+            ("POST", "/api/conversations"),
+            ("GET", "/api/conversations/other-conversation"),
+            ("GET", "/api/conversations/scoped-fixture/messages"),
+            ("POST", "/api/conversations/scoped-fixture"),
+            ("GET", "/api/conversations/scoped-fixture%2fmessages"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(method, path, "scoped-fixture"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+        }
+        // Scoped reads still authenticate; a missing conversation is a domain
+        // 404, while the same token with a different conversation is a 401.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/api/conversations/scoped-fixture", "scoped-fixture"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/api/runtime/skills", "scoped-fixture"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = app
+            .oneshot(request("GET", "/api/runtime/skills", "other-conversation"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        services.database.close().await;
     }
 }
