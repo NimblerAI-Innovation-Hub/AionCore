@@ -36,6 +36,11 @@ pub const RUNTIME_CONVERSATION_ID_HEADER: &str = "x-aionui-conversation-id";
 /// token bound to exactly this (user_id, conversation_id) pair.
 pub trait IRuntimeTokenVerifier: Send + Sync {
     fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool;
+
+    /// Restrict which user API routes a verified conversation helper may call.
+    fn allows_request(&self, _method: &str, _path: &str, _conversation_id: &str) -> bool {
+        true
+    }
 }
 
 /// Authenticated user injected into request extensions by the auth middleware.
@@ -188,7 +193,9 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         return Err(ApiError::Unauthorized("Authentication required".into()));
     };
 
-    if !verifier.verify_conversation_helper(&token, &user_id, &conversation_id) {
+    if !verifier.verify_conversation_helper(&token, &user_id, &conversation_id)
+        || !verifier.allows_request(request.method().as_str(), request.uri().path(), &conversation_id)
+    {
         return Err(ApiError::Unauthorized("Invalid runtime token".into()));
     }
 

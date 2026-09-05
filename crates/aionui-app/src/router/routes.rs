@@ -271,11 +271,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         identity_mode: auth_identity_mode(services.identity_mode),
         // A scoped skill-read token must not implicitly become a browser/user
         // credential in deployments with an external authorization gateway.
-        runtime_token_verifier: services.runtime_features.runtime_user_auth.then(|| {
-            Arc::new(ConversationHelperTokenVerifier {
-                runtime_token_service: services.runtime_token_service.clone(),
-            }) as Arc<dyn IRuntimeTokenVerifier>
-        }),
+        runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
+            runtime_token_service: services.runtime_token_service.clone(),
+            allow_user_api: services.runtime_features.runtime_user_auth,
+        }) as Arc<dyn IRuntimeTokenVerifier>),
     };
 
     // System routes protected by auth middleware
@@ -512,9 +511,16 @@ impl SystemDefaultFilesystemAdopter for SkillFilesystemAdopter {
 /// aionui-ai-agent, so the binding happens here in the composition layer).
 struct ConversationHelperTokenVerifier {
     runtime_token_service: Arc<RuntimeTokenService>,
+    allow_user_api: bool,
 }
 
 impl IRuntimeTokenVerifier for ConversationHelperTokenVerifier {
+    fn allows_request(&self, method: &str, path: &str, conversation_id: &str) -> bool {
+        // AssetLens MCP resolves its Project binding through this exact read.
+        // Matching the token-bound id also excludes nested routes and writes.
+        self.allow_user_api || (method == "GET" && path.strip_prefix("/api/conversations/") == Some(conversation_id))
+    }
+
     fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool {
         self.runtime_token_service
             .validate(
@@ -729,6 +735,10 @@ mod tests {
             ("GET", "/api/conversations"),
             ("GET", "/api/skills"),
             ("POST", "/api/conversations"),
+            ("GET", "/api/conversations/other-conversation"),
+            ("GET", "/api/conversations/scoped-fixture/messages"),
+            ("POST", "/api/conversations/scoped-fixture"),
+            ("GET", "/api/conversations/scoped-fixture%2fmessages"),
         ] {
             let response = app
                 .clone()
@@ -739,6 +749,12 @@ mod tests {
         }
         // Scoped reads still authenticate; a missing conversation is a domain
         // 404, while the same token with a different conversation is a 401.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/api/conversations/scoped-fixture", "scoped-fixture"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         let response = app
             .clone()
             .oneshot(request("GET", "/api/runtime/skills", "scoped-fixture"))
