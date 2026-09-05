@@ -269,9 +269,13 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
         identity_mode: auth_identity_mode(services.identity_mode),
-        runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
-            runtime_token_service: services.runtime_token_service.clone(),
-        })),
+        // A scoped skill-read token must not implicitly become a browser/user
+        // credential in deployments with an external authorization gateway.
+        runtime_token_verifier: services.runtime_features.runtime_user_auth.then(|| {
+            Arc::new(ConversationHelperTokenVerifier {
+                runtime_token_service: services.runtime_token_service.clone(),
+            }) as Arc<dyn IRuntimeTokenVerifier>
+        }),
     };
 
     // System routes protected by auth middleware
@@ -688,5 +692,64 @@ mod tests {
 
         assert_eq!(delivered["data"]["sequence"], 4);
         bridge.abort();
+    }
+    #[tokio::test]
+    async fn deployment_can_restrict_helper_tokens_to_scoped_runtime_reads() {
+        use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig {
+            data_dir: dir.path().join("data"),
+            work_dir: dir.path().join("work"),
+            ..Default::default()
+        };
+        let db = aionui_db::init_database_memory().await.unwrap();
+        let mut services = AppServices::from_config(db, &config).await.unwrap();
+        services.runtime_features.runtime_user_auth = false;
+        let app = crate::create_router(&services).await.unwrap();
+        let issue = services.runtime_token_service.issue(
+            "system_default_user",
+            "scoped-fixture",
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::ConversationHelper],
+        );
+        let request = |method, path, conversation_id| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("x-aionui-user-id", "system_default_user")
+                .header("x-aionui-conversation-id", conversation_id)
+                .header("x-aionui-runtime-token", &issue.token)
+                .body(Body::empty())
+                .unwrap()
+        };
+        for (method, path) in [
+            ("GET", "/api/conversations"),
+            ("GET", "/api/skills"),
+            ("POST", "/api/conversations"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(method, path, "scoped-fixture"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{method} {path}");
+        }
+        // Scoped reads still authenticate; a missing conversation is a domain
+        // 404, while the same token with a different conversation is a 401.
+        let response = app
+            .clone()
+            .oneshot(request("GET", "/api/runtime/skills", "scoped-fixture"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = app
+            .oneshot(request("GET", "/api/runtime/skills", "other-conversation"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        services.database.close().await;
     }
 }

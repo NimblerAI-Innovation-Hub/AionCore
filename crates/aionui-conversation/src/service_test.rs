@@ -4164,6 +4164,33 @@ async fn midturn_send_delivers_into_the_active_turn() {
     assert_eq!(rows[0].status.as_deref(), Some("pending"));
 }
 
+#[tokio::test]
+async fn deployment_gate_preserves_busy_without_persisting_or_steering() {
+    let (svc, broadcaster, repo, _d) = make_service();
+    let svc = svc.with_midturn_delivery_enabled(false);
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let _claim = svc.runtime_state().try_claim_turn(&conv.id, "turn_active").unwrap();
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    broadcaster.take_events();
+    let before = repo.messages.lock().unwrap().len();
+    let error = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::Busy { .. }));
+    assert!(agent.delivered.lock().unwrap().is_empty());
+    assert_eq!(repo.messages.lock().unwrap().len(), before);
+    assert!(
+        !broadcaster
+            .take_events()
+            .iter()
+            .any(|e| e.name == "message.userCreated")
+    );
+}
+
 /// B5 fallback (spec §6甲.1): codex rejected the steer because the turn ended
 /// → the send falls back to opening a NEW turn; the already-persisted message
 /// is reused (no duplicate row) and its status leaves the pending state.

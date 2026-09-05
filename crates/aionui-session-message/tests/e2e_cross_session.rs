@@ -321,3 +321,45 @@ async fn a_delivery_aimed_at_another_users_conversation_is_refused_as_not_found(
         "nothing may be persisted into the other user's conversation"
     );
 }
+
+#[tokio::test]
+async fn deployment_gate_blocks_send_discovery_and_direct_drain_with_default_user_settings() {
+    use aionui_session_message::drainer::{DeliveryOutcome, DeliverySink};
+    use aionui_session_message::error::SessionMessageError;
+    use aionui_session_message::queue::PendingDelivery;
+    use aionui_session_message::service::{SessionMessageDeps, SessionMessageService};
+    let ctx = setup().await;
+    let a = ctx.create_conversation("gate_a", "A", "/w/a").await;
+    let b = ctx.create_conversation("gate_b", "B", "/w/b").await;
+    let service = SessionMessageService::new(SessionMessageDeps {
+        conversation_service: ctx.conversation_service.clone(),
+        conversation_repo: ctx.conversation_repo.clone(),
+        settings_repo: ctx.settings_repo.clone(),
+        task_manager: ctx.task_manager.clone(),
+        broadcaster: ctx.broadcaster.clone(),
+        queue: ctx.queue.clone(),
+        rate_limiter: ctx.rate_limiter.clone(),
+        notify: ctx.notify.clone(),
+    })
+    .with_server_enabled(false);
+    assert!(!service.is_enabled_for(USER).await);
+    assert!(matches!(
+        service.send(USER, &a.id, &request(&b.id, "blocked")).await,
+        Err(SessionMessageError::FeatureDisabled)
+    ));
+    assert!(matches!(
+        service.guard_list_access(USER, &a.id).await,
+        Err(SessionMessageError::FeatureDisabled)
+    ));
+    let outcome = service
+        .deliver(&PendingDelivery {
+            to: b.id.clone(),
+            user_id: USER.to_owned(),
+            from_conversation_id: a.id,
+            message: "blocked".to_owned(),
+            expires_at_ms: i64::MAX,
+        })
+        .await;
+    assert!(matches!(outcome, DeliveryOutcome::HardError(ref reason) if reason == "cross-session delivery disabled"));
+    assert_eq!(ctx.user_message_count(&b.id).await, 0);
+}

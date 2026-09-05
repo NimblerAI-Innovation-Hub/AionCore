@@ -31,6 +31,9 @@ use crate::qr_token::QrTokenStore;
 use crate::rate_limit::{
     RateLimiter, api_rate_limit_middleware, auth_rate_limit_middleware, authenticated_action_rate_limit_middleware,
 };
+use crate::read_rate_limit::{
+    IdentityReadLimits, ReadRatePolicy, aggregate_read_rate_limit_middleware, user_read_rate_limit_middleware,
+};
 use crate::service::{AuthProvisionService, ProvisionError};
 use crate::singleflight::{RefreshCoalescer, RefreshError, RefreshedTokens};
 use crate::validation::{validate_password, validate_username};
@@ -252,12 +255,18 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let auth_limiter = Arc::new(RateLimiter::auth());
     let api_limiter = Arc::new(RateLimiter::api());
     let action_limiter = Arc::new(RateLimiter::authenticated_action());
+    let refresh_limiter = Arc::new(RateLimiter::authenticated_action());
+    let read_limits = Arc::new(
+        IdentityReadLimits::new(ReadRatePolicy::from_env().expect("Invalid identity read rate policy"))
+            .expect("Invalid identity read rate policy"),
+    );
 
     // Start periodic cleanup for rate limiters
     let cleanup_interval = Duration::from_secs(60);
     auth_limiter.start_cleanup_task(cleanup_interval);
     api_limiter.start_cleanup_task(cleanup_interval);
     action_limiter.start_cleanup_task(cleanup_interval);
+    refresh_limiter.start_cleanup_task(cleanup_interval);
 
     let auth_state = AuthState {
         jwt_service: state.jwt_service.clone(),
@@ -281,7 +290,6 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
 
     // API rate limited public routes (no auth required)
     let api_public = Router::new()
-        .route("/api/auth/status", get(status_handler))
         .route(
             "/api/auth/internal/external-users/{external_user_id}",
             put(ensure_external_user_handler),
@@ -336,22 +344,37 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     // route_layer order: last added = outermost (first to process)
     let authenticated = Router::new()
         .route("/logout", post(logout_handler))
-        .route("/api/auth/user", get(user_handler))
         .route("/api/auth/change-password", post(change_password_handler))
-        .route("/api/ws-token", get(ws_token_handler))
         .route_layer(from_fn_with_state(
             action_limiter.clone(),
             authenticated_action_rate_limit_middleware,
         ))
-        .route_layer(from_fn_with_state(auth_state, auth_middleware))
+        .route_layer(from_fn_with_state(auth_state.clone(), auth_middleware))
         .route_layer(from_fn_with_state(api_limiter.clone(), api_rate_limit_middleware))
+        .with_state(state.clone());
+
+    // Identity reads have their own verified-user and process budgets. Forwarded
+    // addresses from a browser or internal adapter cannot mint aggregate buckets.
+    let identity_reads = Router::new()
+        .route("/api/auth/user", get(user_handler))
+        .route("/api/ws-token", get(ws_token_handler))
+        .route_layer(from_fn_with_state(read_limits.clone(), user_read_rate_limit_middleware))
+        .route_layer(from_fn_with_state(auth_state, auth_middleware))
+        .route_layer(from_fn_with_state(
+            read_limits.clone(),
+            aggregate_read_rate_limit_middleware,
+        ))
+        .with_state(state.clone());
+    let status_reads = Router::new()
+        .route("/api/auth/status", get(status_handler))
+        .route_layer(from_fn_with_state(read_limits, aggregate_read_rate_limit_middleware))
         .with_state(state.clone());
 
     // API + action limited routes (token in body, no auth middleware)
     let api_action_limited = Router::new()
         .route("/api/auth/refresh", post(refresh_handler))
         .route_layer(from_fn_with_state(
-            action_limiter,
+            refresh_limiter,
             authenticated_action_rate_limit_middleware,
         ))
         .route_layer(from_fn_with_state(api_limiter, api_rate_limit_middleware))
@@ -364,6 +387,8 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         .merge(auth_rate_limited)
         .merge(api_public)
         .merge(authenticated)
+        .merge(identity_reads)
+        .merge(status_reads)
         .merge(api_action_limited)
         .merge(static_routes)
 }
@@ -559,15 +584,27 @@ async fn login_handler(
 // POST /logout
 // ---------------------------------------------------------------------------
 
-async fn logout_handler(State(state): State<AuthRouterState>, headers: HeaderMap) -> Result<Response, ApiError> {
+async fn logout_handler(
+    State(state): State<AuthRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Refresh cookies are path-scoped and cannot be read here. Persisted
+    // generation revocation also invalidates an already-running refresh, even
+    // if its Set-Cookie headers reach another tab after this logout response.
+    state
+        .user_repo
+        .increment_session_generation(&user.id)
+        .await
+        .map_err(db_error_to_api_error)?;
+    if let Some(hook) = state.session_revoked_hook.as_ref() {
+        hook(&user.id);
+    }
     if let Some(token) = extract_token_from_headers(&headers) {
         state.jwt_service.blacklist_token(&token);
     }
 
-    // Clear both credential cookies. The refresh cookie is path-scoped to the
-    // refresh endpoint, so the browser does not send it here to be blacklisted;
-    // clearing it drops it client-side, and full server-side revocation is via
-    // the user's session generation (password change / session revoke).
+    // Clear both cookies after the persisted server-side revocation.
     let session_cookie = state.cookie_config.clear_session_cookie();
     let refresh_cookie = state.cookie_config.clear_refresh_cookie();
     let resp = ApiResponse::message("Logged out successfully");
@@ -604,9 +641,19 @@ async fn status_handler(
 
     // Check authentication without requiring it. Only an access token counts as
     // "authenticated" — a refresh token is not a request credential.
-    let is_authenticated = extract_token_from_headers(&headers)
-        .and_then(|token| state.jwt_service.verify_access(&token).ok())
-        .is_some();
+    let payload = extract_token_from_headers(&headers).and_then(|token| state.jwt_service.verify_access(&token).ok());
+    let is_authenticated = match payload {
+        Some(payload) => state
+            .user_repo
+            .find_active_by_id(&payload.user_id)
+            .await
+            .map_err(db_error_to_api_error)?
+            .is_some_and(|user| {
+                user.session_generation == payload.session_generation
+                    && (!state.aionpro_mode || user.user_type == UserType::Aionpro)
+            }),
+        None => false,
+    };
 
     Ok(Json(AuthStatusResponse {
         success: true,
@@ -834,7 +881,7 @@ async fn refresh_handler(
     let (raw_token, from_cookie) = match extract_cookie_value(&headers, REFRESH_COOKIE_NAME) {
         Some(cookie_token) => (cookie_token, true),
         None => {
-            let Json(req) = body.map_err(ApiError::from)?;
+            let Json(req) = body.map_err(|_| ApiError::Unauthorized("Refresh credential required".into()))?;
             (req.token, false)
         }
     };

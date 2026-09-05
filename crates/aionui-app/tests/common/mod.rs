@@ -69,6 +69,7 @@ pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router
 
     let ext_paths_mgr = std::sync::Arc::new(ExternalPathsManager::with_file(root.join("paths.json")).await);
     states.skill = SkillRouterState {
+        session_messages_enabled: true,
         skill_paths: paths.clone(),
         skill_repo: std::sync::Arc::new(aionui_db::SqliteSkillRepository::new(services.database.pool().clone())),
         external_paths_manager: ext_paths_mgr,

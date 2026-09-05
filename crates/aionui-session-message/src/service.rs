@@ -96,22 +96,32 @@ pub struct SessionMessageDeps {
 
 pub struct SessionMessageService {
     deps: SessionMessageDeps,
+    server_enabled: bool,
 }
 
 impl SessionMessageService {
     pub fn new(deps: SessionMessageDeps) -> Self {
-        Self { deps }
+        Self {
+            deps,
+            server_enabled: true,
+        }
+    }
+
+    /// Apply the deployment gate independently of each user's setting.
+    pub fn with_server_enabled(mut self, enabled: bool) -> Self {
+        self.server_enabled = enabled;
+        self
     }
 
     pub fn queue(&self) -> &Arc<DeliveryQueue> {
         &self.deps.queue
     }
 
-    /// The global toggle, per user (`system_settings.user_id` is its PK).
-    /// A read failure is treated as ENABLED — the toggle is an opt-out panic
-    /// button, and a transient DB error must not silently disable a feature the
-    /// user left on.
+    /// Both deployment and user policy must permit delivery. Lookup errors fail closed.
     pub async fn is_enabled_for(&self, user_id: &str) -> bool {
+        if !self.server_enabled {
+            return false;
+        }
         match self.deps.settings_repo.get_settings(user_id).await {
             Ok(Some(settings)) => settings.cross_session_message_enabled,
             // No row yet → defaults, and the default is on.
@@ -120,9 +130,9 @@ impl SessionMessageService {
                 warn!(
                     user_id,
                     error = %error,
-                    "cross-session toggle lookup failed; treating the feature as enabled"
+                    "cross-session toggle lookup failed; refusing delivery"
                 );
-                true
+                false
             }
         }
     }
@@ -449,6 +459,9 @@ fn classify_delivery_failure(error: ConversationError) -> DeliverAttemptError {
 #[async_trait]
 impl DeliverySink for SessionMessageService {
     async fn deliver(&self, item: &PendingDelivery) -> DeliveryOutcome {
+        if !self.is_enabled_for(&item.user_id).await {
+            return DeliveryOutcome::HardError("cross-session delivery disabled".to_owned());
+        }
         match self.deliver_now(&item.user_id, &item.to, item.message.clone()).await {
             Ok(_) => DeliveryOutcome::Delivered,
             Err(DeliverAttemptError::Transient(_)) => DeliveryOutcome::Busy,

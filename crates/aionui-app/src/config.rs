@@ -25,6 +25,41 @@ impl IdentityMode {
     }
 }
 
+/// Server capability switches; user settings cannot override these gates.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RuntimeFeaturePolicy {
+    pub session_messages: bool,
+    pub midturn_delivery: bool,
+    pub runtime_user_auth: bool,
+}
+
+impl RuntimeFeaturePolicy {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            session_messages: parse_feature_switch(
+                "AIONUI_SESSION_MESSAGES_ENABLED",
+                std::env::var("AIONUI_SESSION_MESSAGES_ENABLED").ok().as_deref(),
+            )?,
+            runtime_user_auth: parse_feature_switch(
+                "AIONUI_RUNTIME_USER_AUTH_ENABLED",
+                std::env::var("AIONUI_RUNTIME_USER_AUTH_ENABLED").ok().as_deref(),
+            )?,
+            midturn_delivery: parse_feature_switch(
+                "AIONUI_MIDTURN_DELIVERY_ENABLED",
+                std::env::var("AIONUI_MIDTURN_DELIVERY_ENABLED").ok().as_deref(),
+            )?,
+        })
+    }
+}
+
+fn parse_feature_switch(name: &str, value: Option<&str>) -> anyhow::Result<bool> {
+    match value {
+        None | Some("1" | "true") => Ok(true),
+        Some("0" | "false") => Ok(false),
+        Some(_) => anyhow::bail!("{name} must be 0, 1, false, or true"),
+    }
+}
+
 /// Application configuration parsed from CLI arguments.
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -143,5 +178,19 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(config.database_path(), PathBuf::from("/tmp/aionui/aionui-backend.db"));
+    }
+}
+
+#[cfg(test)]
+mod runtime_feature_policy_tests {
+    use super::parse_feature_switch;
+
+    #[test]
+    fn explicit_deployment_gates_are_validated() {
+        assert!(!parse_feature_switch("gate", Some("0")).unwrap());
+        assert!(!parse_feature_switch("gate", Some("false")).unwrap());
+        assert!(parse_feature_switch("gate", Some("1")).unwrap());
+        assert!(parse_feature_switch("gate", Some("TRUE")).is_err());
+        assert!(parse_feature_switch("gate", Some("")).is_err());
     }
 }

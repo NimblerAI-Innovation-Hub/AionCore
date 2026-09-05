@@ -701,7 +701,10 @@ async fn t9_3_refresh_missing_token() {
     let req = json_post("/api/auth/refresh", r#"{}"#);
     let resp = app.oneshot(req).await.unwrap();
 
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    // A missing cookie and missing legacy credential are definitive auth loss,
+    // allowing clients to distinguish it from malformed requests or outages.
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(resp).await["code"], "UNAUTHORIZED");
 }
 
 #[tokio::test]
@@ -1299,4 +1302,90 @@ async fn t12_2_internal_user_routes_work_in_local_mode() {
     let renamed_json = body_json(renamed_resp).await;
     assert_eq!(renamed_json["data"]["id"], user_id);
     assert_eq!(renamed_json["data"]["username"], "renamed-admin");
+}
+
+#[tokio::test]
+async fn identity_reads_do_not_consume_sensitive_action_capacity_and_keep_revocation() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    for index in 0..40 {
+        let path = if index % 2 == 0 {
+            "/api/auth/user"
+        } else {
+            "/api/ws-token"
+        };
+        let response = app.clone().oneshot(get_with_token(path, &token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "identity read {index}");
+    }
+    // Reads have not spent the separate 20-action bucket. Handler-originated
+    // 401s are deliberately unmarked: replaying these could repeat an action.
+    for index in 0..20 {
+        let response = app
+            .clone()
+            .oneshot(json_post_with_token(
+                "/api/auth/change-password",
+                r#"{"current_password":"WrongP@ss1","new_password":"NewP@ssword2"}"#,
+                &token,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "action {index}");
+        assert!(!response.headers().contains_key("x-aionui-auth-rejected"));
+    }
+    let response = app
+        .clone()
+        .oneshot(json_post_with_token(
+            "/api/auth/change-password",
+            r#"{"current_password":"WrongP@ss1","new_password":"NewP@ssword2"}"#,
+            &token,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    let response = app
+        .clone()
+        .oneshot(get_with_token("/api/auth/user", &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let user = ctx.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    ctx.user_repo.increment_session_generation(&user.id).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(get_with_token("/api/auth/user", &token))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()["x-aionui-auth-rejected"], "1");
+    let response = app.oneshot(get_with_token("/api/auth/status", &token)).await.unwrap();
+    assert_eq!(body_json(response).await["is_authenticated"], false);
+}
+
+#[tokio::test]
+async fn logout_revokes_refresh_tokens_that_were_already_issued() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let user = ctx.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    let refresh = ctx
+        .jwt_service
+        .sign_refresh(&user.id, "admin", user.session_generation)
+        .unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/logout")
+        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/auth/refresh")
+        .header(header::COOKIE, format!("aionui-refresh={refresh}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = app.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(body_json(response).await["error"], "Invalid authentication session");
 }

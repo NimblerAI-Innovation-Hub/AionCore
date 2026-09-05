@@ -46,6 +46,8 @@ fn is_auto_inject_builtin_skill(source: SkillSource, relative_location: Option<&
 /// Shared state for skill/rule route handlers.
 #[derive(Clone)]
 pub struct SkillRouterState {
+    /// Deployment-level gate for session-message discovery.
+    pub session_messages_enabled: bool,
     pub skill_paths: SkillPaths,
     pub skill_repo: Arc<dyn ISkillRepository>,
     pub external_paths_manager: Arc<ExternalPathsManager>,
@@ -122,6 +124,7 @@ async fn list_skills(
     .await?;
     let resp: Vec<SkillListItemResponse> = items
         .into_iter()
+        .filter(|s| state.session_messages_enabled || s.name != "session-message")
         .map(|s| SkillListItemResponse {
             is_auto_inject: is_auto_inject_builtin_skill(s.source, s.relative_location.as_deref()),
             name: s.name,
@@ -639,6 +642,7 @@ mod tests {
         let skill_repo = Arc::new(aionui_db::SqliteSkillRepository::new(db.pool().clone()));
         std::mem::forget(tmp);
         SkillRouterState {
+            session_messages_enabled: true,
             skill_paths: paths,
             skill_repo,
             external_paths_manager: ext_mgr,
@@ -667,5 +671,38 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+    #[tokio::test]
+    async fn disabled_session_messages_are_absent_from_skill_discovery() {
+        let mut state = make_state().await;
+        state.session_messages_enabled = false;
+        for name in ["session-message", "safe-skill"] {
+            let dir = state.skill_paths.builtin_skills_dir.join("auto-inject").join(name);
+            tokio::fs::create_dir_all(&dir).await.unwrap();
+            tokio::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: fixture\n---\nBody"),
+            )
+            .await
+            .unwrap();
+        }
+        skill_service::sync_skill_catalog_into_repo(&state.skill_paths, state.skill_repo.as_ref())
+            .await
+            .unwrap();
+        let response = skill_routes(state)
+            .layer(Extension(CurrentUser::local_default()))
+            .oneshot(Request::builder().uri("/api/skills").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let data: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let names: Vec<_> = data["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["safe-skill"]);
     }
 }

@@ -81,11 +81,22 @@ pub trait SkillResolver: Send + Sync {
 pub struct ExtensionSkillResolver {
     paths: Arc<aionui_extension::SkillPaths>,
     skill_repo: Arc<dyn ISkillRepository>,
+    session_messages_enabled: bool,
 }
 
 impl ExtensionSkillResolver {
     pub fn new(paths: Arc<aionui_extension::SkillPaths>, skill_repo: Arc<dyn ISkillRepository>) -> Self {
-        Self { paths, skill_repo }
+        Self {
+            paths,
+            skill_repo,
+            session_messages_enabled: true,
+        }
+    }
+
+    /// Suppress native and injected discovery for a deployment-disabled capability.
+    pub fn with_session_messages_enabled(mut self, enabled: bool) -> Self {
+        self.session_messages_enabled = enabled;
+        self
     }
 }
 
@@ -120,7 +131,8 @@ impl SkillResolver for ExtensionSkillResolver {
                 let mut names: Vec<String> = items
                     .into_iter()
                     .filter(|item| {
-                        item.source == aionui_extension::SkillSource::Builtin
+                        (self.session_messages_enabled || item.name != "session-message")
+                            && item.source == aionui_extension::SkillSource::Builtin
                             && item
                                 .relative_location
                                 .as_deref()
@@ -149,6 +161,11 @@ impl SkillResolver for ExtensionSkillResolver {
         if names.is_empty() {
             return Vec::new();
         }
+        let names: Vec<String> = names
+            .iter()
+            .filter(|name| self.session_messages_enabled || name.as_str() != "session-message")
+            .cloned()
+            .collect();
         // Conversation_id is validated upstream; we don't use a real one here
         // because this resolver is purely a path-resolution helper.
         match aionui_extension::materialize_skills_for_agent_with_repo_for_user(
@@ -156,7 +173,7 @@ impl SkillResolver for ExtensionSkillResolver {
             self.skill_repo.as_ref(),
             user_id,
             "skill-resolve",
-            names,
+            &names,
         )
         .await
         {
@@ -301,6 +318,11 @@ mod tests {
             "Auto-injected builtin",
         );
         write_skill(&paths.cron_skills_dir, "scheduled-task", "Cron source skill");
+        write_skill(
+            &paths.builtin_skills_dir.join("auto-inject"),
+            "session-message",
+            "Disabled capability",
+        );
 
         let db = aionui_db::init_database_memory().await.unwrap();
         let repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(db.pool().clone()));
@@ -308,9 +330,14 @@ mod tests {
             .await
             .unwrap();
 
-        let resolver = ExtensionSkillResolver::new(paths, repo);
-
+        let resolver = ExtensionSkillResolver::new(paths, repo).with_session_messages_enabled(false);
         assert_eq!(resolver.auto_inject_names().await, vec!["auto-cron".to_string()]);
+        assert!(
+            resolver
+                .resolve_skills(&["session-message".to_string()])
+                .await
+                .is_empty()
+        );
     }
 
     #[tokio::test]
