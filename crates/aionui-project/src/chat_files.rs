@@ -69,8 +69,9 @@ impl ProjectService {
     ///   realpath containment; read paths pass `Read`, the write endpoint passes `Write`); must exist
     ///   (file or folder).
     /// - `Upload` → an existing regular file under the managed `upload_root` (D2 invariant).
-    /// - `Local` → a canonicalized existing regular file; **no sandbox** (the host picker that
-    ///   produced it already exposes the whole filesystem).
+    /// - `Local` → an existing regular file, returned under its canonical parent with the
+    ///   file name as given; **no sandbox** (the host picker that produced it already
+    ///   exposes the whole filesystem).
     ///
     /// `op` only affects the `Project` arm's containment mode; `Upload`/`Local` are path-based and
     /// identical regardless of op.
@@ -117,14 +118,29 @@ impl ProjectService {
                 // A path the user explicitly picked in the host-file browser,
                 // which already exposes the whole filesystem. No managed-root
                 // restriction (that is the upload channel's D2 invariant only);
-                // just canonicalize (collapsing `..`/symlinks) and require an
-                // existing regular file.
+                // require an existing regular file.
                 let canonical = std::fs::canonicalize(path)
                     .map_err(|_| ProjectError::LocalPathNotReadable { path: path.clone() })?;
                 if !canonical.is_file() {
                     return Err(ProjectError::LocalPathNotReadable { path: path.clone() });
                 }
-                Ok(canonical.to_string_lossy().into_owned())
+                // Collapse `..` and symlinked directories, but keep the file
+                // name that was checked. Media classification and native media
+                // reads key off this name, so a final-component link swapped in
+                // after an upstream authorization check can never turn a
+                // non-media attachment into a media read of its target.
+                let given = Path::new(path);
+                let (Some(parent), Some(name)) = (given.parent(), given.file_name()) else {
+                    return Err(ProjectError::LocalPathNotReadable { path: path.clone() });
+                };
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                let parent = std::fs::canonicalize(parent)
+                    .map_err(|_| ProjectError::LocalPathNotReadable { path: path.clone() })?;
+                Ok(parent.join(name).to_string_lossy().into_owned())
             }
         }
     }

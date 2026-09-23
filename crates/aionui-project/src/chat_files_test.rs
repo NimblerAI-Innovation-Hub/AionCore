@@ -230,7 +230,7 @@ async fn local_readable_file_resolves_and_inlines_marker() {
 
     assert_eq!(out.files.len(), 1);
     let abs = &out.files[0];
-    // Resolved to the canonicalized absolute path (symlinks/`..` collapsed).
+    // Resolved to an absolute path under the canonical parent.
     assert!(std::path::Path::new(abs).is_file());
     assert!(abs.ends_with("host.txt"));
     assert_eq!(out.content, format!("see this\n\n{AIONUI_FILES_MARKER}\n{abs}"));
@@ -238,41 +238,65 @@ async fn local_readable_file_resolves_and_inlines_marker() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn local_canonicalizes_symlink_to_target_path() {
+async fn local_keeps_the_given_file_name_for_a_symlink() {
     let (service, _pe, _dir, upload_root) = setup().await;
-    // A symlink whose name differs from its target, so we can prove the
-    // resolved path is the *target* (canonicalized), not the link we were given.
+    // A link whose name (and media type) differs from its target: the resolved
+    // path must keep the checked name, so media classification cannot be steered
+    // to the target by swapping in a link after an upstream authorization check.
     let d = tempfile::tempdir().unwrap();
-    let target = d.path().join("real_target.txt");
-    std::fs::write(&target, b"hi").unwrap();
-    let link = d.path().join("link_name.txt");
+    let target = d.path().join("real_target.png");
+    std::fs::write(&target, b"png").unwrap();
+    let link = d.path().join("notes.txt");
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    let link_path = link.to_string_lossy().into_owned();
 
     let out = service
         .resolve_chat_message(
             "system_default_user",
             "x",
             &[ChatFileRef::Local {
-                path: link_path.clone(),
+                path: link.to_string_lossy().into_owned(),
             }],
             upload_root.path(),
         )
         .await
         .unwrap();
 
-    assert_eq!(out.files.len(), 1);
-    let resolved = &out.files[0];
-    // `canonicalize` collapses the symlink to the target's real path — this is
-    // the behavior a `PathBuf::from(path)` mutation would break.
-    let expected = std::fs::canonicalize(&target).unwrap().to_string_lossy().into_owned();
-    assert_eq!(resolved, &expected, "expected canonicalized target, got {resolved}");
-    assert!(
-        resolved.ends_with("real_target.txt"),
-        "should be target name, not link name"
-    );
-    assert_ne!(resolved, &link_path, "must not echo back the raw symlink path");
-    assert_eq!(out.content, format!("x\n\n{AIONUI_FILES_MARKER}\n{resolved}"));
+    let expected = std::fs::canonicalize(d.path())
+        .unwrap()
+        .join("notes.txt")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(out.files, vec![expected.clone()]);
+    assert_eq!(out.content, format!("x\n\n{AIONUI_FILES_MARKER}\n{expected}"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn local_collapses_a_symlinked_directory_and_dot_dot() {
+    let (service, _pe, _dir, upload_root) = setup().await;
+    let d = tempfile::tempdir().unwrap();
+    std::fs::create_dir(d.path().join("real")).unwrap();
+    std::fs::write(d.path().join("real/host.txt"), b"hi").unwrap();
+    std::os::unix::fs::symlink(d.path().join("real"), d.path().join("alias")).unwrap();
+    let given = d.path().join("alias/../alias/host.txt");
+
+    let out = service
+        .resolve_chat_message(
+            "system_default_user",
+            "x",
+            &[ChatFileRef::Local {
+                path: given.to_string_lossy().into_owned(),
+            }],
+            upload_root.path(),
+        )
+        .await
+        .unwrap();
+
+    let expected = std::fs::canonicalize(d.path().join("real/host.txt"))
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(out.files, vec![expected]);
 }
 
 #[tokio::test]
