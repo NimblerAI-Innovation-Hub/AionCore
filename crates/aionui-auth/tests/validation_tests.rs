@@ -120,3 +120,16 @@ fn weak_password_rejected() {
     assert!(validate_password("12345678").is_err());
     assert!(validate_password("qwertyui").is_err());
 }
+
+#[test]
+fn password_length_counts_unicode_scalars_and_bounds_utf8_bytes() {
+    for password in ["🦀".repeat(7), "é".repeat(7), "🦀".repeat(129), "a".repeat(129)] {
+        assert!(matches!(
+            aionui_auth::validate_password(&password),
+            Err(aionui_auth::AuthError::WeakPassword(_))
+        ));
+    }
+    for password in ["🦀".repeat(8), "é".repeat(128), "🦀".repeat(128), "a".repeat(128)] {
+        assert!(aionui_auth::validate_password(&password).is_ok());
+    }
+}

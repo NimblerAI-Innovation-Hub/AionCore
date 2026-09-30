@@ -2,6 +2,7 @@ use crate::error::AuthError;
 
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MAX_PASSWORD_LENGTH: usize = 128;
+const MAX_PASSWORD_BYTES: usize = 4 * MAX_PASSWORD_LENGTH;
 const MIN_USERNAME_LENGTH: usize = 3;
 const MAX_USERNAME_LENGTH: usize = 32;
 
@@ -14,19 +15,27 @@ const WEAK_PASSWORDS: &[&str] = &["password", "12345678", "123456789", "qwertyui
 /// - Length: 8-128 characters
 /// - Not in the weak password blacklist (case-insensitive)
 pub fn validate_password(password: &str) -> Result<(), AuthError> {
-    if password.len() < MIN_PASSWORD_LENGTH {
+    validate_password_size(password)?;
+    if password.chars().count() < MIN_PASSWORD_LENGTH {
         return Err(AuthError::WeakPassword(format!(
             "Password must be at least {MIN_PASSWORD_LENGTH} characters"
-        )));
-    }
-    if password.len() > MAX_PASSWORD_LENGTH {
-        return Err(AuthError::WeakPassword(format!(
-            "Password must not exceed {MAX_PASSWORD_LENGTH} characters"
         )));
     }
     let lower = password.to_lowercase();
     if WEAK_PASSWORDS.contains(&lower.as_str()) {
         return Err(AuthError::WeakPassword("Password is too common".into()));
+    }
+    Ok(())
+}
+
+/// Bound input before copying, case folding, or hashing. UTF-8 uses at most
+/// four bytes per Unicode scalar. Login only applies this maximum: tightening
+/// strength checks on existing credentials would invalidate legacy accounts.
+pub(crate) fn validate_password_size(password: &str) -> Result<(), AuthError> {
+    if password.len() > MAX_PASSWORD_BYTES || password.chars().count() > MAX_PASSWORD_LENGTH {
+        return Err(AuthError::WeakPassword(format!(
+            "Password must not exceed {MAX_PASSWORD_LENGTH} characters"
+        )));
     }
     Ok(())
 }
