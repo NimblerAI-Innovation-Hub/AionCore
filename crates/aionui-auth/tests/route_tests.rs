@@ -544,20 +544,66 @@ async fn t7_3_get_user_no_token() {
 #[tokio::test]
 async fn t8_1_change_password_success() {
     let (mut app, ctx) = test_app().await;
-    create_test_user(&ctx, "admin", "OldP@ssword1").await;
-    let (token, _) = login(&mut app, "admin", "OldP@ssword1").await;
+    // Legacy credential: login must not replace the ambiguous bcrypt hash.
+    let old_password = format!("{}original", "a".repeat(72));
+    let legacy_hash = bcrypt::hash(&old_password, 4).unwrap();
+    ctx.user_repo
+        .set_system_user_credentials("admin", &legacy_hash)
+        .await
+        .unwrap();
+    let (token, _) = login(&mut app, "admin", &old_password).await;
+    let user = ctx.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    assert_eq!(user.password_hash.as_deref(), Some(legacy_hash.as_str()));
 
-    let req = json_post_with_token(
-        "/api/auth/change-password",
-        r#"{"current_password":"OldP@ssword1","new_password":"NewP@ssword2"}"#,
-        &token,
-    );
-    let resp = app.oneshot(req).await.unwrap();
-
+    // More than 128 UTF-8 bytes, but within the 128-character policy.
+    let new_password = format!("{}original", "🦀".repeat(32));
+    let body = serde_json::json!({"current_password": old_password, "new_password": new_password}).to_string();
+    let resp = app
+        .clone()
+        .oneshot(json_post_with_token("/api/auth/change-password", &body, &token))
+        .await
+        .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     assert_eq!(json["message"], "Password changed successfully");
+
+    let user = ctx.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    let stored = user.password_hash.unwrap();
+    assert!(!stored.starts_with("$2"), "explicit change did not migrate");
+    for (password, expected) in [
+        (new_password, StatusCode::OK),
+        (format!("{}different", "🦀".repeat(32)), StatusCode::UNAUTHORIZED),
+        (old_password, StatusCode::UNAUTHORIZED),
+    ] {
+        let body = serde_json::json!({"username": "admin", "password": password}).to_string();
+        let resp = app.clone().oneshot(json_post("/login", &body)).await.unwrap();
+        assert_eq!(resp.status(), expected);
+    }
+}
+
+#[tokio::test]
+async fn local_reset_migrates_legacy_credentials() {
+    let (app, ctx) = test_app_with_local(true).await;
+    let legacy_hash = bcrypt::hash("OldP@ssword1", 4).unwrap();
+    ctx.user_repo
+        .set_system_user_credentials("admin", &legacy_hash)
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(json_post("/api/webui/reset-password", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let password = json["data"]["new_password"].as_str().unwrap();
+    let user = ctx.user_repo.find_by_username("admin").await.unwrap().unwrap();
+    let stored = user.password_hash.unwrap();
+    assert!(!stored.starts_with("$2"), "reset did not migrate");
+    assert!(aionui_auth::validate_password(password).is_ok());
+    assert!(aionui_auth::verify_password(password, &stored).unwrap());
+    assert!(!aionui_auth::verify_password("OldP@ssword1", &stored).unwrap());
 }
 
 #[tokio::test]

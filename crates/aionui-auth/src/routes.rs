@@ -498,9 +498,7 @@ async fn login_handler(
     if req.username.len() > 32 {
         return Err(ApiError::BadRequest("Username must not exceed 32 characters".into()));
     }
-    if req.password.len() > 128 {
-        return Err(ApiError::BadRequest("Password must not exceed 128 characters".into()));
-    }
+    crate::validation::validate_password_size(&req.password)?;
 
     // Look up user; run dummy verify on miss to prevent timing attacks
     let user = state
