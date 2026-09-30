@@ -1,10 +1,23 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
+use sha2::{Digest, Sha256};
+
 use crate::error::AuthError;
+use crate::validation::validate_password_size;
 
 /// bcrypt cost factor (higher = slower but more secure).
 const BCRYPT_COST: u32 = 12;
+
+/// Versioned encoding; bare bcrypt hashes remain legacy credentials.
+const PASSWORD_HASH_PREFIX: &str = "$aionui-bcrypt-sha256-v1$";
+
+/// Encode the full UTF-8 input into 43 printable bytes, below bcrypt's 72-byte
+/// limit and without embedded NUL bytes. Do not trim or normalize passwords.
+fn password_digest(password: &str) -> String {
+    STANDARD_NO_PAD.encode(Sha256::digest(password.as_bytes()))
+}
 
 /// Minimum time for password verification to prevent timing attacks.
 const MIN_VERIFY_DURATION: Duration = Duration::from_millis(50);
@@ -20,22 +33,35 @@ const ALL_PASSWORD_CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqr
 /// Pre-computed dummy hash for timing attack prevention.
 static DUMMY_HASH: OnceLock<String> = OnceLock::new();
 
-/// Hash a password using bcrypt with cost factor 12.
+/// Hash the complete password using versioned SHA-256 + bcrypt at cost 12.
 ///
 /// **Note**: This is a CPU-intensive blocking operation. In async contexts,
 /// wrap in `tokio::task::spawn_blocking`.
 pub fn hash_password(password: &str) -> Result<String, AuthError> {
-    bcrypt::hash(password, BCRYPT_COST).map_err(|e| AuthError::HashError(e.to_string()))
+    validate_password_size(password)?;
+    let hash = bcrypt::hash(password_digest(password), BCRYPT_COST).map_err(|e| AuthError::HashError(e.to_string()))?;
+    Ok(format!("{PASSWORD_HASH_PREFIX}{hash}"))
 }
 
-/// Verify a password against a bcrypt hash.
+/// Verify new versioned hashes or legacy bare bcrypt hashes.
+///
+/// Never rewrite legacy hashes on login: bcrypt discarded suffixes past byte
+/// 72, so the original secret cannot be recovered or safely distinguished from
+/// an alias. Explicit password changes/resets migrate through `hash_password`.
 ///
 /// Returns `true` if the password matches, `false` otherwise.
 /// bcrypt internally uses constant-time comparison.
 ///
 /// **Note**: This is a CPU-intensive blocking operation.
 pub fn verify_password(password: &str, hash: &str) -> Result<bool, AuthError> {
-    bcrypt::verify(password, hash).map_err(|e| AuthError::HashError(e.to_string()))
+    if validate_password_size(password).is_err() {
+        return Ok(false);
+    }
+    if let Some(bcrypt_hash) = hash.strip_prefix(PASSWORD_HASH_PREFIX) {
+        bcrypt::verify(password_digest(password), bcrypt_hash).map_err(|e| AuthError::HashError(e.to_string()))
+    } else {
+        bcrypt::verify(password, hash).map_err(|e| AuthError::HashError(e.to_string()))
+    }
 }
 
 /// Verify a password with a guaranteed minimum execution time of 50ms.
@@ -45,12 +71,16 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool, AuthError> {
 /// "user exists + wrong password" from "user doesn't exist".
 pub async fn verify_password_timed(password: &str, hash: &str) -> Result<bool, AuthError> {
     let start = Instant::now();
-    let password = password.to_owned();
-    let hash = hash.to_owned();
-
-    let result = tokio::task::spawn_blocking(move || verify_password(&password, &hash))
-        .await
-        .map_err(|e| AuthError::HashError(format!("Task join error: {e}")))?;
+    // Reject oversized input before allocating a copy or scheduling CPU work.
+    let result = if validate_password_size(password).is_err() {
+        Ok(false)
+    } else {
+        let password = password.to_owned();
+        let hash = hash.to_owned();
+        tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+            .await
+            .map_err(|e| AuthError::HashError(format!("Task join error: {e}")))?
+    };
 
     let elapsed = start.elapsed();
     if elapsed < MIN_VERIFY_DURATION {
@@ -69,7 +99,7 @@ pub fn dummy_password_hash() -> &'static str {
     DUMMY_HASH.get_or_init(|| {
         // bcrypt hash of a fixed dummy input. This cannot fail for valid input;
         // if it does, the bcrypt implementation is fundamentally broken.
-        bcrypt::hash("__aionui_dummy_password__", BCRYPT_COST).expect("bcrypt hash of constant input must succeed")
+        hash_password("__aionui_dummy_password__").expect("hash of constant input must succeed")
     })
 }
 
@@ -93,8 +123,8 @@ pub fn generate_user_credentials() -> (String, String) {
 /// Guarantees ≥1 character from each category (upper, lower, digit, special)
 /// and fills remaining slots from a mixed charset.
 pub fn generate_password(len: usize) -> String {
-    // Enforce minimum length of 4 to satisfy the four-category guarantee.
-    generate_strong_password(len.max(4))
+    // Bound allocation and satisfy the four-category guarantee.
+    generate_strong_password(len.clamp(4, 128))
 }
 
 // --- Internal helpers ---
@@ -166,31 +196,21 @@ mod tests {
     fn hash_and_verify_correct_password() {
         let hash = hash_password("my_secure_password").unwrap();
         assert!(verify_password("my_secure_password", &hash).unwrap());
-    }
-
-    #[test]
-    fn verify_wrong_password() {
-        let hash = hash_password("correct_password").unwrap();
         assert!(!verify_password("wrong_password", &hash).unwrap());
     }
 
     #[test]
-    fn hash_produces_bcrypt_format() {
+    fn hash_produces_versioned_bcrypt_format() {
         let hash = hash_password("test_password").unwrap();
-        assert!(hash.starts_with("$2b$12$"));
+        assert!(hash.starts_with(&format!("{PASSWORD_HASH_PREFIX}$2b$12$")));
     }
 
     #[test]
     fn dummy_hash_is_valid_bcrypt() {
         let hash = dummy_password_hash();
-        assert!(hash.starts_with("$2b$12$"));
-        assert!(!verify_password("random", hash).unwrap());
-    }
-
-    #[test]
-    fn dummy_hash_matches_dummy_input() {
-        let hash = dummy_password_hash();
         assert!(verify_password("__aionui_dummy_password__", hash).unwrap());
+        assert!(hash.starts_with(&format!("{PASSWORD_HASH_PREFIX}$2b$12$")));
+        assert!(!verify_password("random", hash).unwrap());
     }
 
     #[test]
