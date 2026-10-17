@@ -709,6 +709,9 @@ struct PendingPerm {
     tool_name: String,
     /// The original tool input (for AskUserQuestion: `{questions:[…]}`).
     input: serde_json::Value,
+    /// Native hints and scope bundle; kept separate from the input echoed back
+    /// to Claude. A card's display description must never rewrite tool arguments.
+    permission: crate::adapter::ClaudePermissionContext,
 }
 
 /// Everything `ClaudeSessionBackend::wake_handle` needs to re-spawn (`--resume`)
@@ -1092,17 +1095,16 @@ impl ClaudeSessionBackend {
         answers: &[super::types::QuestionAnswer],
     ) -> Result<CommandReceipt, BackendError> {
         use std::sync::atomic::Ordering;
-        let pending = self
-            .pending_perms
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(request_id);
-        let Some(pending) = pending else {
-            return Err(BackendError::Transport(format!(
-                "no pending permission for request_id {request_id}"
-            )));
+        let (pending, response) = {
+            let mut pending = self.pending_perms.lock().unwrap_or_else(|e| e.into_inner());
+            let request = pending
+                .get(request_id)
+                .ok_or_else(|| BackendError::Transport(format!("no pending permission for request_id {request_id}")))?;
+            // Validate the exact native scope BEFORE consuming pending state.
+            // A stale/legacy Always must leave the card answerable, without a write.
+            let response = build_control_response(request_id, request, decision, selected, answers)?;
+            (pending.remove(request_id).expect("validated pending request"), response)
         };
-        let response = build_control_response(request_id, &pending, decision, selected, answers);
         {
             let mut guard = self.stdin.lock().await;
             let stdin = guard
@@ -1179,7 +1181,7 @@ impl ClaudeSessionBackend {
             Some(list) => (super::types::PermissionDecision::Approved, list.as_slice()),
             None => (super::types::PermissionDecision::Denied, &[][..]),
         };
-        let response = build_control_response(request_id, &pending, decision, None, answer_slice);
+        let response = build_control_response(request_id, &pending, decision, None, answer_slice)?;
         {
             let mut guard = self.stdin.lock().await;
             let stdin = guard
@@ -1493,10 +1495,15 @@ fn build_control_response(
     decision: super::types::PermissionDecision,
     selected: Option<&str>,
     answers: &[super::types::QuestionAnswer],
-) -> serde_json::Value {
+) -> Result<serde_json::Value, BackendError> {
     use super::types::PermissionDecision;
     use serde_json::json;
     let allow = matches!(decision, PermissionDecision::Approved | PermissionDecision::AllowAlways);
+    if decision == PermissionDecision::AllowAlways && !pending.permission.accepts_suggestion(selected) {
+        return Err(BackendError::Transport(
+            "native permission scope is unavailable or stale; choose a current option".into(),
+        ));
+    }
     let result = if !allow {
         json!({ "behavior": "deny", "message": "User rejected the request.", "toolUseID": pending.tool_use_id })
     } else if pending.tool_name == "AskUserQuestion" {
@@ -1509,24 +1516,31 @@ fn build_control_response(
         }
         json!({ "behavior": "allow", "updatedInput": updated, "toolUseID": pending.tool_use_id })
     } else {
-        // claude's stdio control-response schema REQUIRES `updatedInput` (a record) on
-        // the allow branch (unlike the SDK's in-process canUseTool schema where it is
-        // .optional()). Omitting it makes claude's ZodError reject the whole union
-        // (`updatedInput: expected record, received undefined`) → "Tool permission
-        // request failed" → the approved tool never runs (Write/Bash etc. all fail).
-        // Echo the original tool input unchanged ("run with this input"); fall back to
-        // an empty object if (defensively) it is not a record so the frame stays valid.
+        // Preserve the original-input echo required by older CLI versions. The
+        // matching SDK 0.3.294 PermissionResult now makes updatedInput optional;
+        // retaining it also proves display hints never become tool arguments.
         let updated_input = if pending.input.is_object() {
             pending.input.clone()
         } else {
             json!({})
         };
-        json!({ "behavior": "allow", "updatedInput": updated_input, "toolUseID": pending.tool_use_id })
+        let mut result =
+            json!({ "behavior": "allow", "updatedInput": updated_input, "toolUseID": pending.tool_use_id });
+        if decision == PermissionDecision::AllowAlways {
+            // Verified: SDK 0.3.294 PermissionResult and sdk.mjs forward this exact
+            // native bundle as updatedPermissions. Never use client-supplied rules.
+            result["updatedPermissions"] = pending
+                .permission
+                .permission_suggestions
+                .clone()
+                .expect("validated scope");
+        }
+        result
     };
-    json!({
+    Ok(json!({
         "type": "control_response",
         "response": { "subtype": "success", "request_id": request_id, "response": result }
-    })
+    }))
 }
 
 /// Build the `updatedInput.answers` object claude's AskUserQuestion reads (live
@@ -2160,6 +2174,7 @@ fn register_or_clear_pending(
                     tool_use_id: tool_use_id.to_string(),
                     tool_name,
                     input: request.get("input").cloned().unwrap_or(Value::Null),
+                    permission: crate::adapter::ClaudePermissionContext::from_request(request),
                 },
             );
         }
@@ -3527,8 +3542,8 @@ impl SessionBackend for ClaudeSessionBackend {
     /// (insert on each `can_use_tool` control_request, remove on `AnswerPermission`
     /// and on `control_cancel_request`). Map each entry to a safe view — `request_id`
     /// (the card's id/call_id) + `tool_name` (the title). The raw tool `input` is NOT
-    /// exposed (TIO-13: it carries command bodies / args). claude does not advertise
-    /// options, so the recovered card's options default is synthesized frontend-side.
+    /// exposed (TIO-13: it carries command bodies / args). Native permission hints
+    /// recover the same reason and scope choices as the live card.
     fn pending_permission_requests(&self) -> Vec<PendingPermissionView> {
         self.pending_perms
             .lock()
@@ -3548,6 +3563,7 @@ impl SessionBackend for ClaudeSessionBackend {
                     request_id: request_id.clone(),
                     tool_name: perm.tool_name.clone(),
                     questions,
+                    metadata: (perm.tool_name != "AskUserQuestion").then(|| perm.permission.metadata()),
                 }
             })
             .collect()
@@ -4936,12 +4952,32 @@ mod tests {
     /// asserts both effects.
     #[tokio::test]
     async fn answer_permission_writes_control_response_and_resolves() {
-        let fixture = concat!(
-            r#"{"type":"control_request","request_id":"req-7","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"toolu-7","input":{"command":"ls"}}}"#,
-            "\n",
+        let updates = serde_json::json!([
+            {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"ls:*"}],"behavior":"allow","destination":"localSettings"},
+            {"type":"replaceRules","rules":[{"toolName":"Write","ruleContent":"./fixture/**"}],"behavior":"deny","destination":"userSettings"},
+            {"type":"removeRules","rules":[{"toolName":"Read"}],"behavior":"ask","destination":"projectSettings"},
+            {"type":"setMode","mode":"plan","destination":"cliArg"},
+            {"type":"addDirectories","directories":["/workspace/fixture"],"destination":"session"},
+            {"type":"removeDirectories","directories":["/workspace/previous"],"destination":"localSettings"}
+        ]);
+        let fixture = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type":"control_request", "request_id":"req-7", "request":{
+                    "subtype":"can_use_tool", "tool_name":"Bash", "tool_use_id":"toolu-7",
+                    "input":{"command":"ls"}, "decision_reason":"Review this scope",
+                    "permission_suggestions":updates, "default_to_no":true
+                }
+            }),
+            serde_json::json!({
+                "type":"control_request", "request_id":"req-8", "request":{
+                    "subtype":"can_use_tool", "tool_name":"Bash", "tool_use_id":"toolu-8",
+                    "input":{"command":"ls"}, "permission_suggestions":updates,
+                    "suppress_always_allow_rule":true
+                }
+            })
         )
-        .as_bytes()
-        .to_vec();
+        .into_bytes();
         // never_exits: the persistent process stays alive so we can answer + read
         // back what we wrote on stdin.
         let fake = FakeAgentIo::never_exits(fixture);
@@ -4952,7 +4988,7 @@ mod tests {
         let mut events = backend.events();
         let saw_perm = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while let Some(env) = events.next().await {
-                if matches!(env.event, SessionEvent::Permission { ref request_id, .. } if request_id == "req-7") {
+                if matches!(env.event, SessionEvent::Permission { ref request_id, .. } if request_id == "req-8") {
                     return true;
                 }
             }
@@ -4962,11 +4998,79 @@ mod tests {
         .unwrap_or(false);
         assert!(saw_perm, "can_use_tool surfaced as Permission{{request_id}}");
 
+        let pending = backend.pending_permission_requests();
+        let hints = crate::adapter::ClaudePermissionContext::from_metadata(
+            pending
+                .iter()
+                .find(|p| p.request_id == "req-7")
+                .unwrap()
+                .metadata
+                .as_ref(),
+        )
+        .unwrap();
+        assert_eq!(hints.decision_reason.as_deref(), Some("Review this scope"));
+        assert!(hints.default_to_no);
+        let (choice, label) = hints.suggestion_option().unwrap();
+        assert_eq!(label, "Allow this call and apply the listed permission changes");
+        let description = hints.description();
+        for detail in [
+            "Add allow rules",
+            "Replace deny rules",
+            "Remove ask rules",
+            "all inputs",
+            "Set permission mode to plan",
+            "Add directories",
+            "Remove directories",
+            "localSettings",
+            "userSettings",
+            "projectSettings",
+            "cliArg",
+            "session",
+            "ls:*",
+            "./fixture/**",
+            "/workspace/fixture",
+            "/workspace/previous",
+        ] {
+            assert!(
+                description.contains(detail),
+                "all native bundle actions, scopes and destinations are visible: {detail}"
+            );
+        }
+        let mut other_scope = hints.clone();
+        other_scope.permission_suggestions.as_mut().unwrap()[0]["destination"] = serde_json::json!("userSettings");
+        let (other_choice, _) = other_scope.suggestion_option().unwrap();
+        let before = captured.lock().await.clone();
+        for (request_id, selected) in [
+            ("req-7", None),
+            ("req-7", Some(other_choice.as_str())),
+            ("req-8", Some(choice.as_str())),
+        ] {
+            let error = backend
+                .dispatch(Command::AnswerPermission {
+                    request_id: request_id.into(),
+                    decision: super::super::types::PermissionDecision::AllowAlways,
+                    selected: selected.map(str::to_owned),
+                    answers: Vec::new(),
+                })
+                .await
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("native permission scope is unavailable or stale")
+            );
+            assert_eq!(
+                backend.pending_permission_requests().len(),
+                2,
+                "invalid Always keeps both requests pending"
+            );
+            assert_eq!(*captured.lock().await, before, "invalid Always writes no response");
+        }
         let receipt = backend
             .dispatch(Command::AnswerPermission {
                 request_id: "req-7".into(),
-                decision: super::super::types::PermissionDecision::Approved,
-                selected: None,
+                decision: super::super::types::PermissionDecision::AllowAlways,
+                selected: Some(choice),
                 answers: Vec::new(),
             })
             .await
@@ -4978,7 +5082,9 @@ mod tests {
             let mut s = String::new();
             for _ in 0..40 {
                 s = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
-                if s.contains("control_response") {
+                // FakeAgentIo drains in chunks; a native bundle can span several.
+                // Wait for the NDJSON frame boundary before parsing the response.
+                if s.contains("control_response") && s.ends_with('\n') {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(25)).await;
@@ -5011,6 +5117,20 @@ mod tests {
             written.contains(r#""updatedInput""#) && written.contains(r#""command":"ls""#),
             "plain-tool allow frame MUST carry updatedInput == original input (ZodError guard), got: {written}"
         );
+        let response: serde_json::Value = written
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|frame| frame["type"] == "control_response")
+            .unwrap();
+        assert_eq!(
+            response["response"]["response"]["updatedPermissions"], updates,
+            "return exactly the native update set"
+        );
+        assert_eq!(
+            response["response"]["response"]["updatedInput"],
+            serde_json::json!({"command":"ls"}),
+            "native hints never become tool arguments"
+        );
 
         // (b) PermissionResolved broadcast (FSM leaves requires-action).
         let saw_resolved = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -5025,6 +5145,31 @@ mod tests {
         .await
         .unwrap_or(false);
         assert!(saw_resolved, "AnswerPermission broadcasts PermissionResolved{{req-7}}");
+        backend
+            .dispatch(Command::AnswerPermission {
+                request_id: "req-8".into(),
+                decision: super::super::types::PermissionDecision::Approved,
+                selected: None,
+                answers: Vec::new(),
+            })
+            .await
+            .expect("suppressed persistent choice still permits explicit allow once");
+        assert!(backend.pending_permission_requests().is_empty());
+        let mut written = String::new();
+        for _ in 0..40 {
+            written = String::from_utf8(captured.lock().await.clone()).unwrap();
+            if written.contains(r#""request_id":"req-8""#) && written.ends_with('\n') {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let response = written
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|frame| frame["response"]["request_id"] == "req-8")
+            .unwrap();
+        assert_eq!(response["response"]["response"]["behavior"], "allow");
+        assert!(response["response"]["response"].get("updatedPermissions").is_none());
     }
 
     /// REST-recovery source: `pending_permission_requests()` lists the OUTSTANDING
@@ -5985,6 +6130,7 @@ mod tests {
         use super::super::types::PermissionDecision;
         let pending = PendingPerm {
             tool_use_id: "toolu-1".into(),
+            permission: Default::default(),
             tool_name: "AskUserQuestion".into(),
             input: serde_json::json!({
                 "questions": [{
@@ -5994,7 +6140,7 @@ mod tests {
             }),
         };
         // User picked "Beta" (the SECOND option) — must be answered, not "Alpha".
-        let resp = build_control_response("req-1", &pending, PermissionDecision::Approved, Some("Beta"), &[]);
+        let resp = build_control_response("req-1", &pending, PermissionDecision::Approved, Some("Beta"), &[]).unwrap();
         let answers = &resp["response"]["response"]["updatedInput"]["answers"];
         assert_eq!(
             answers["Pick one"], "Beta",
@@ -6004,14 +6150,14 @@ mod tests {
         assert_eq!(resp["response"]["response"]["toolUseID"], "toolu-1");
 
         // No `selected` → degrade to the first option (a plain allow).
-        let degraded = build_control_response("req-1", &pending, PermissionDecision::Approved, None, &[]);
+        let degraded = build_control_response("req-1", &pending, PermissionDecision::Approved, None, &[]).unwrap();
         assert_eq!(
             degraded["response"]["response"]["updatedInput"]["answers"]["Pick one"], "Alpha",
             "None selected → first-option degrade"
         );
 
         // Denied ignores the label entirely → deny body.
-        let denied = build_control_response("req-1", &pending, PermissionDecision::Denied, Some("Beta"), &[]);
+        let denied = build_control_response("req-1", &pending, PermissionDecision::Denied, Some("Beta"), &[]).unwrap();
         assert_eq!(denied["response"]["response"]["behavior"], "deny");
     }
 
@@ -6030,6 +6176,7 @@ mod tests {
         // emits (see the array fixture's control_request input).
         let pending = PendingPerm {
             tool_use_id: "toolu-9".into(),
+            permission: Default::default(),
             tool_name: "AskUserQuestion".into(),
             input: serde_json::json!({
                 "questions": [
@@ -6052,7 +6199,7 @@ mod tests {
                 labels: vec!["Auth".into(), "Logging".into()],
             },
         ];
-        let resp = build_control_response("req-9", &pending, PermissionDecision::Approved, None, &answers);
+        let resp = build_control_response("req-9", &pending, PermissionDecision::Approved, None, &answers).unwrap();
         let updated = &resp["response"]["response"]["updatedInput"];
         let ans = &updated["answers"];
 
@@ -6089,12 +6236,13 @@ mod tests {
     #[test]
     fn build_control_response_plain_tool_allow_carries_updated_input() {
         use super::super::types::PermissionDecision;
-        let pending = PendingPerm {
+        let mut pending = PendingPerm {
             tool_use_id: "toolu-bash".into(),
+            permission: Default::default(),
             tool_name: "Bash".into(),
             input: serde_json::json!({ "command": "ls" }),
         };
-        let resp = build_control_response("req-bash", &pending, PermissionDecision::Approved, None, &[]);
+        let resp = build_control_response("req-bash", &pending, PermissionDecision::Approved, None, &[]).unwrap();
         let body = &resp["response"]["response"];
         assert_eq!(body["behavior"], "allow");
         assert_eq!(body["toolUseID"], "toolu-bash");
@@ -6108,6 +6256,60 @@ mod tests {
             body["updatedInput"]["command"], "ls",
             "original tool input echoed unchanged"
         );
+        assert!(
+            body.get("updatedPermissions").is_none(),
+            "allow once creates no persistent permission"
+        );
+        assert!(
+            build_control_response("req-bash", &pending, PermissionDecision::AllowAlways, None, &[]).is_err(),
+            "no native suggestions means no Always"
+        );
+        pending.permission.permission_suggestions = Some(serde_json::json!([
+            {"type":"setMode", "mode":"bypassPermissions", "destination":"session"}
+        ]));
+        let (choice, _) = pending
+            .permission
+            .suggestion_option()
+            .expect("native mode update remains available");
+        assert!(
+            pending
+                .permission
+                .description()
+                .contains("Set permission mode to bypassPermissions in this session (session)")
+        );
+        let scoped = build_control_response(
+            "req-bash",
+            &pending,
+            PermissionDecision::AllowAlways,
+            Some(&choice),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            scoped["response"]["response"]["updatedPermissions"],
+            *pending.permission.permission_suggestions.as_ref().unwrap()
+        );
+        assert_eq!(scoped["response"]["response"]["updatedInput"], pending.input);
+        pending.permission.permission_suggestions = Some(serde_json::json!([
+            {"type":"unknownFutureUpdate", "destination":"session"}
+        ]));
+        assert!(
+            pending.permission.suggestion_option().is_none(),
+            "unknown wire shapes are not fabricated into permissions"
+        );
+        assert!(
+            build_control_response(
+                "req-bash",
+                &pending,
+                PermissionDecision::AllowAlways,
+                Some("allow_always"),
+                &[]
+            )
+            .is_err()
+        );
+        let once = build_control_response("req-bash", &pending, PermissionDecision::Approved, None, &[]).unwrap();
+        assert_eq!(once["response"]["response"]["updatedInput"], pending.input);
+        assert!(once["response"]["response"].get("updatedPermissions").is_none());
     }
 
     /// Defensive: a non-object tool input still yields a valid `{}` record (never
@@ -6117,10 +6319,11 @@ mod tests {
         use super::super::types::PermissionDecision;
         let pending = PendingPerm {
             tool_use_id: "toolu-x".into(),
+            permission: Default::default(),
             tool_name: "Weird".into(),
             input: serde_json::json!("not-an-object"),
         };
-        let resp = build_control_response("req-x", &pending, PermissionDecision::Approved, None, &[]);
+        let resp = build_control_response("req-x", &pending, PermissionDecision::Approved, None, &[]).unwrap();
         let updated = &resp["response"]["response"]["updatedInput"];
         assert!(
             updated.is_object() && updated.as_object().unwrap().is_empty(),

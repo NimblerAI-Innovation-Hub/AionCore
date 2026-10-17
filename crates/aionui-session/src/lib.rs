@@ -48,7 +48,7 @@ pub mod testing;
 // `crate::adapter::`. Only the transport types (`AgentIo`/`ManagedProcessIo`) have
 // external consumers; the legacy `BackendAdapter`/`ClaudeAdapter`/`SessionSpec` are
 // internal-only and no longer re-exported (DUP-10).
-pub use adapter::{AgentIo, ManagedProcessIo, is_valid_claude_permission_mode};
+pub use adapter::{AgentIo, ClaudePermissionContext, ManagedProcessIo, is_valid_claude_permission_mode};
 // 007 §C1 seam: the live Command/SessionSpec/etc. DUP-10 removed the legacy
 // `command`/`session` modules that forced the `BackendCommand`/`BackendSessionSpec`
 // aliases, so these are now exported under their plain names.
