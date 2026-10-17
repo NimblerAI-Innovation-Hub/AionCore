@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use aionui_common::{AgentKillReason, ConversationStatus, TimestampMs, now_ms};
 use aionui_session::{
-    BackendError, Command, CommandMeta, ContentBlock, ModeInfo, ModelInfo, SessionBackend, SessionEnvelope,
-    SessionEvent, ToolResultContent,
+    BackendError, ClaudePermissionContext, Command, CommandMeta, ContentBlock, ModeInfo, ModelInfo, SessionBackend,
+    SessionEnvelope, SessionEvent, ToolResultContent,
 };
 use futures_util::stream::BoxStream;
 use tokio::sync::broadcast;
@@ -708,6 +708,7 @@ impl SessionAgentTask {
             .pending_permission_requests()
             .into_iter()
             .map(|p| {
+                let native = ClaudePermissionContext::from_metadata(p.metadata.as_ref());
                 let is_ask = p.tool_name == "AskUserQuestion";
                 let options = if is_ask {
                     // `p.questions` is the bare `questions[]` ARRAY, but the
@@ -722,16 +723,22 @@ impl SessionAgentTask {
                     Vec::new()
                 };
                 let options = if options.is_empty() {
-                    default_permission_options()
+                    permission_options(native.as_ref())
                 } else {
                     options
                 };
                 aionui_common::Confirmation {
                     id: p.request_id.clone(),
                     call_id: p.request_id,
-                    title: (!p.tool_name.is_empty()).then(|| p.tool_name.clone()),
+                    title: native
+                        .as_ref()
+                        .and_then(|hints| hints.title.clone())
+                        .or_else(|| (!p.tool_name.is_empty()).then(|| p.tool_name.clone())),
                     action: None,
-                    description: String::new(),
+                    description: native
+                        .as_ref()
+                        .map(ClaudePermissionContext::description)
+                        .unwrap_or_default(),
                     command_type: None,
                     // The full question payload rides along so the frontend
                     // recovery rebuilds the REAL question card; the flattened
@@ -808,7 +815,8 @@ impl SessionAgentTask {
         Ok(())
     }
 
-    /// `always_allow` (legacy flag) forces AllowAlways regardless.
+    /// Native persistent choices must match the currently pending scope bundle.
+    /// The legacy `always_allow` flag cannot manufacture a Claude permission rule.
     pub fn confirm(
         &self,
         _msg_id: &str,
@@ -818,8 +826,34 @@ impl SessionAgentTask {
     ) -> Result<(), AgentError> {
         use aionui_session::PermissionDecision;
         let picked = confirm_option_id(&data);
-        let (decision, selected) = if always_allow {
-            (PermissionDecision::AllowAlways, None)
+        let native_scope = picked
+            .as_deref()
+            .is_some_and(|id| id.starts_with("claude_allow_suggestions:"));
+        let wants_scope = native_scope || always_allow || picked.as_deref() == Some(PERM_ALLOW_ALWAYS);
+        if wants_scope {
+            let pending = self.backend.pending_permission_requests();
+            let native = pending
+                .iter()
+                .find(|p| p.request_id == call_id)
+                .and_then(|current| ClaudePermissionContext::from_metadata(current.metadata.as_ref()));
+            // ACP backends may keep their permission registry private. Only a
+            // native Claude choice requires this recovery view; legacy choices
+            // retain their existing dispatch behavior when no native hints exist.
+            if native
+                .as_ref()
+                .is_some_and(|hints| !hints.accepts_suggestion(picked.as_deref()))
+                || (native_scope && native.is_none())
+            {
+                return Err(AgentError::bad_request(
+                    "native permission scope is unavailable or stale; choose a current option",
+                ));
+            }
+        }
+        let (decision, selected) = if wants_scope {
+            (
+                PermissionDecision::AllowAlways,
+                native_scope.then(|| picked.clone().expect("selected native scope")),
+            )
         } else {
             match picked.as_deref() {
                 Some(PERM_REJECT) => (PermissionDecision::Denied, None),
@@ -3747,6 +3781,34 @@ fn default_permission_options() -> Vec<crate::protocol::events::AcpPermissionOpt
     ]
 }
 
+fn permission_options(
+    native: Option<&ClaudePermissionContext>,
+) -> Vec<crate::protocol::events::AcpPermissionOptionData> {
+    use crate::protocol::events::{AcpPermissionOptionData, AcpPermissionOptionKind};
+    let Some(native) = native else {
+        return default_permission_options();
+    };
+    let mut options = default_permission_options();
+    options.retain(|option| option.option_id != PERM_ALLOW_ALWAYS);
+    if let Some((option_id, name)) = native.suggestion_option() {
+        options.insert(
+            1,
+            AcpPermissionOptionData {
+                option_id,
+                name,
+                kind: AcpPermissionOptionKind::AllowAlways,
+                meta: None,
+            },
+        );
+    }
+    // Transport the native hint and put rejection first. This changes option/tab
+    // order only; it does not implement the native client's keyboard semantics.
+    if native.default_to_no {
+        options.sort_by_key(|option| option.option_id != PERM_REJECT);
+    }
+    options
+}
+
 /// Project an AskUserQuestion tool `input` into permission-card options the user can
 /// pick. `input` shape (claude, live-captured): `{questions:[{question, header,
 /// options:[{label, description}], multiSelect}]}`. The frontend card is single-select
@@ -4357,8 +4419,10 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             request_id,
             tool_name,
             input,
+            metadata,
             ..
         } => {
+            let native = ClaudePermissionContext::from_metadata(metadata.as_ref());
             // The frontend permission card renders whatever `options[]` we send as the
             // selectable choices (MessageAcpPermission maps each to a radio). So the
             // options MUST reflect what the user is actually choosing between:
@@ -4376,10 +4440,31 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 Vec::new()
             };
             let options = if options.is_empty() {
-                default_permission_options()
+                permission_options(native.as_ref())
             } else {
                 options
             };
+            // This is a DISPLAY copy only. ClaudeSessionBackend keeps the original
+            // input independently and echoes it unchanged in updatedInput.
+            let mut display_input = input;
+            if let Some(hints) = &native {
+                let description = hints.description();
+                if !description.is_empty() {
+                    let display = display_input.get_or_insert_with(|| serde_json::json!({}));
+                    if let Some(fields) = display.as_object_mut() {
+                        let original = fields
+                            .get("description")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let combined = if original.is_empty() || original == description {
+                            description
+                        } else {
+                            format!("{original}\n{description}")
+                        };
+                        fields.insert("description".into(), serde_json::Value::String(combined));
+                    }
+                }
+            }
             vec![AgentStreamEvent::AcpPermission(
                 crate::protocol::events::AcpPermissionEventData::Request(
                     crate::protocol::events::AcpPermissionRequestData {
@@ -4387,16 +4472,16 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                         tool_call: crate::protocol::events::AcpPermissionToolCall {
                             tool_call_id: request_id,
                             status: None,
-                            title: tool_name,
+                            title: native.as_ref().and_then(|hints| hints.title.clone()).or(tool_name),
                             kind: None,
-                            raw_input: input,
+                            raw_input: display_input,
                             raw_output: None,
                             content: None,
                             locations: None,
                             meta: None,
                         },
                         options,
-                        meta: None,
+                        meta: native.and_then(|hints| serde_json::from_value(hints.metadata()).ok()),
                     },
                 ),
             )]
@@ -5602,6 +5687,66 @@ mod translate_tests {
         assert_eq!(req.options.len(), 3);
         let ids: Vec<&str> = req.options.iter().map(|o| o.option_id.as_str()).collect();
         assert_eq!(ids, vec!["allow", "allow_always", "reject"]);
+
+        let mut native = ClaudePermissionContext {
+            decision_reason: Some("Native safety check".into()),
+            permission_suggestions: Some(serde_json::json!([
+                {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"ls:*"}],"behavior":"allow","destination":"localSettings"}
+            ])),
+            default_to_no: true,
+            title: Some("Review command".into()),
+            ..Default::default()
+        };
+        let input = serde_json::json!({"command":"ls", "description":"Original tool description"});
+        for suppressed in [false, true] {
+            native.suppress_always_allow_rule = suppressed;
+            let events = translate_event(
+                SessionEvent::Permission {
+                    request_id: "req-native".into(),
+                    kind: PermissionKind::Tool,
+                    metadata: Some(native.metadata()),
+                    tool_name: Some("Bash".into()),
+                    input: Some(input.clone()),
+                },
+                "conv-1",
+                false,
+            );
+            let AgentStreamEvent::AcpPermission(crate::protocol::events::AcpPermissionEventData::Request(req)) =
+                &events[0]
+            else {
+                panic!("expected native card");
+            };
+            assert_eq!(req.tool_call.title.as_deref(), Some("Review command"));
+            assert_eq!(req.tool_call.raw_input.as_ref().unwrap()["command"], "ls");
+            assert!(
+                req.to_confirmation()
+                    .description
+                    .starts_with("Original tool description\nNative safety check\n")
+            );
+            assert!(req.to_confirmation().description.contains("localSettings"));
+            assert!(req.to_confirmation().description.contains("ls:*"));
+            assert_eq!(
+                input["description"], "Original tool description",
+                "only the display copy gains the reason"
+            );
+            assert_eq!(
+                req.options[0].option_id, "reject",
+                "native default-to-no keeps rejection first"
+            );
+            assert_eq!(req.options[1].option_id, "allow", "allow once remains available");
+            let serialized = serde_json::to_value(req).unwrap();
+            assert_eq!(serialized["_meta"]["claude"]["default_to_no"], true);
+            assert_eq!(serialized["_meta"]["claude"]["suppress_always_allow_rule"], suppressed);
+            if suppressed {
+                assert_eq!(req.options.len(), 2, "suppressed Always is not offered");
+            } else {
+                assert_eq!(req.options.len(), 3);
+                let (id, label) = native.suggestion_option().unwrap();
+                assert_eq!(req.options[2].option_id, id);
+                assert_eq!(req.options[2].name, label);
+                assert_eq!(label, "Allow this call and apply the listed permission changes");
+            }
+        }
     }
 
     // An AskUserQuestion permission must surface the QUESTION's own option labels as
@@ -9266,6 +9411,7 @@ mod pump_tests {
     async fn get_confirmations_recovers_pending_ask_user_question() {
         let backend: Arc<dyn SessionBackend> = Arc::new(PendingPermBackend(aionui_session::PendingPermissionView {
             request_id: "req-recover".into(),
+            metadata: None,
             tool_name: "AskUserQuestion".into(),
             // The BARE questions[] array — matching what claude_conn's
             // pending_permission_requests() actually stores
@@ -9305,6 +9451,7 @@ mod pump_tests {
     async fn get_confirmations_recovers_generic_permission() {
         let backend: Arc<dyn SessionBackend> = Arc::new(PendingPermBackend(aionui_session::PendingPermissionView {
             request_id: "req-tool".into(),
+            metadata: None,
             tool_name: "Bash".into(),
             questions: None,
         }));
@@ -9324,6 +9471,118 @@ mod pump_tests {
             .filter_map(|o| o.value.as_str().map(str::to_owned))
             .collect();
         assert_eq!(vals, vec!["allow", "allow_always", "reject"]);
+        task.confirm("msg", "req-tool", serde_json::json!("allow_always"), false)
+            .expect("metadata-free permissions retain the legacy Always path");
+
+        let backend = Arc::new(RecordingBackend {
+            commands: std::sync::Mutex::new(Vec::new()),
+            blocks: aionui_session::BlockSet::default(),
+        });
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-legacy".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend.clone() as Arc<dyn SessionBackend>,
+            None,
+        );
+        assert!(task.get_confirmations().is_empty());
+        for (id, value, legacy) in [("option", "allow_always", false), ("flag", "allow", true)] {
+            task.confirm("msg", id, serde_json::json!(value), legacy)
+                .expect("a backend without recovery support must still accept legacy Always");
+        }
+        let error = task
+            .confirm(
+                "msg",
+                "unknown",
+                serde_json::json!("claude_allow_suggestions:stale"),
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error, AgentError::BadRequest(ref message) if message.contains("native permission scope is unavailable or stale")),
+            "a native scope still requires a current server-owned bundle: {error:?}"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while backend.commands.lock().unwrap().len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("legacy permissions dispatched");
+        let commands = backend.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2, "the stale native choice was not dispatched");
+        for command in commands.iter() {
+            assert!(matches!(
+                command,
+                Command::AnswerPermission {
+                    decision: aionui_session::PermissionDecision::AllowAlways,
+                    selected: None,
+                    ..
+                }
+            ));
+        }
+        drop(commands);
+
+        let mut native = ClaudePermissionContext {
+            decision_reason: Some("Native safety check".into()),
+            permission_suggestions: Some(serde_json::json!([
+                {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"ls:*"}],"behavior":"allow","destination":"session"}
+            ])),
+            default_to_no: true,
+            title: Some("Review command".into()),
+            ..Default::default()
+        };
+        for suppressed in [false, true] {
+            native.suppress_always_allow_rule = suppressed;
+            let backend: Arc<dyn SessionBackend> =
+                Arc::new(PendingPermBackend(aionui_session::PendingPermissionView {
+                    request_id: "req-native".into(),
+                    tool_name: "Bash".into(),
+                    questions: None,
+                    metadata: Some(native.metadata()),
+                }));
+            let task = SessionAgentTask::new(
+                AgentType::Acp,
+                "conv-1".into(),
+                "user-1".into(),
+                "/w".into(),
+                backend,
+                None,
+            );
+            let recovered = task.get_confirmations().pop().unwrap();
+            assert_eq!(recovered.title.as_deref(), Some("Review command"));
+            assert!(recovered.description.starts_with("Native safety check\n"));
+            assert!(recovered.description.contains("session") && recovered.description.contains("ls:*"));
+            assert_eq!(recovered.options[0].value, "reject");
+            assert_eq!(recovered.options[1].value, "allow");
+            if suppressed {
+                assert_eq!(recovered.options.len(), 2);
+            } else {
+                assert_eq!(recovered.options.len(), 3);
+                let (id, label) = native.suggestion_option().unwrap();
+                assert_eq!(recovered.options[2].value, id);
+                assert_eq!(recovered.options[2].label, label);
+            }
+            // REST rejects stale or unsupported Always synchronously; a card
+            // must not disappear on a success reply before backend validation.
+            for (call_id, value, legacy) in [
+                ("req-native", "allow_always", false),
+                ("req-native", "allow", true),
+                ("req-native", "claude_allow_suggestions:stale", false),
+                ("gone", "claude_allow_suggestions:stale", false),
+            ] {
+                let error = task
+                    .confirm("msg", call_id, serde_json::json!(value), legacy)
+                    .unwrap_err();
+                assert!(matches!(error, AgentError::BadRequest(_)));
+                assert_eq!(
+                    task.get_confirmations().len(),
+                    1,
+                    "invalid choice leaves the pending card intact"
+                );
+            }
+        }
     }
 
     /// Backend whose capabilities advertise modes+models but whose current_* never

@@ -4602,6 +4602,7 @@ impl SessionBackend for CodexSessionBackend {
                 request_id: request_id.clone(),
                 tool_name: title.clone(),
                 questions: None,
+                metadata: None,
             })
             .collect()
     }
