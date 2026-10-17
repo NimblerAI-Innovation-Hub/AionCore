@@ -241,8 +241,8 @@ pub enum SessionEvent {
         /// this; the conversation facade consults an injected `PermissionAuthorizer`
         /// and, if it auto-approves, dispatches `AnswerPermission` instead of
         /// surfacing a card. The reducer NEVER reads it (ref-counts on request_id
-        /// only — §R9). `None` for backends/paths that carry no MCP context
-        /// (claude direct-CLI raises permission only for AskUserQuestion).
+        /// only — §R9). Claude's native display/scope hints live separately under
+        /// `claude`; they never populate ACP's server_name/options allowlist fields.
         /// `#[serde(default)]` so older persisted frames deserialize as `None`.
         /// ⚠️ TIO-13: may carry a tool title — never log at info level.
         #[serde(default)]

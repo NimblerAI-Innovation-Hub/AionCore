@@ -15,6 +15,210 @@ use super::{AgentIo, BackendAdapter, ManagedProcessIo, SessionSpec};
 use crate::capability::{Capabilities, CapabilityTier, ModeInfo, SignalSet};
 use crate::event::SessionEvent;
 
+/// Native permission hints, separate from ACP's auto-approval metadata and from
+/// the original tool input. Verified against @anthropic-ai/claude-agent-sdk
+/// 0.3.294 (package.json: claudeCodeVersion 2.1.294), sdk.d.ts
+/// SDKControlPermissionRequest / PermissionUpdate and sdk.mjs handleControlRequest.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ClaudePermissionContext {
+    pub decision_reason: Option<String>,
+    pub permission_suggestions: Option<Value>,
+    pub suppress_always_allow_rule: bool,
+    pub default_to_no: bool,
+    pub title: Option<String>,
+    pub description: Option<String>,
+}
+
+impl ClaudePermissionContext {
+    pub(crate) fn from_request(request: &Value) -> Self {
+        let text = |key| request.get(key).and_then(Value::as_str).map(permission_text);
+        Self {
+            decision_reason: text("decision_reason"),
+            permission_suggestions: request.get("permission_suggestions").cloned(),
+            suppress_always_allow_rule: request.get("suppress_always_allow_rule").and_then(Value::as_bool)
+                == Some(true),
+            default_to_no: request.get("default_to_no").and_then(Value::as_bool) == Some(true),
+            title: text("title"),
+            description: text("description"),
+        }
+    }
+
+    pub fn from_metadata(metadata: Option<&Value>) -> Option<Self> {
+        serde_json::from_value(metadata?.get("claude")?.clone()).ok()
+    }
+
+    pub fn metadata(&self) -> Value {
+        json!({ "claude": self })
+    }
+
+    pub fn description(&self) -> String {
+        let mut lines = Vec::new();
+        for text in [&self.description, &self.decision_reason].into_iter().flatten() {
+            if !text.is_empty() && !lines.contains(text) {
+                lines.push(text.clone());
+            }
+        }
+        if let Some(details) = self.suggestion_details() {
+            let heading = if self.suppress_always_allow_rule {
+                "Native permission changes (not offered for this request):"
+            } else {
+                "Permission changes applied only if you choose the listed-changes option:"
+            };
+            lines.push(format!("{heading}\n{details}"));
+        }
+        lines.join("\n")
+    }
+
+    /// The SDK's CanUseTool contract says suggestions are a FULL update set,
+    /// not alternatives. Describe every verified PermissionUpdate variant without
+    /// changing any wire value. JSON string quoting keeps control characters and
+    /// whitespace visible in tool rules/directories, rather than sanitizing scope.
+    fn suggestion_details(&self) -> Option<String> {
+        let updates = self.permission_suggestions.as_ref()?.as_array()?;
+        if updates.is_empty() {
+            return None;
+        }
+        let mut details = Vec::new();
+        for (index, update) in updates.iter().enumerate() {
+            let object = update.as_object()?;
+            let destination = match update.get("destination")?.as_str()? {
+                "userSettings" => "user settings (userSettings)",
+                "projectSettings" => "project settings (projectSettings)",
+                "localSettings" => "local project settings (localSettings)",
+                "session" => "this session (session)",
+                "cliArg" => "CLI arguments (cliArg)",
+                _ => return None,
+            };
+            let action = update.get("type")?.as_str()?;
+            let (allowed_keys, detail): (&[&str], String) = match action {
+                "addRules" | "replaceRules" | "removeRules" => {
+                    let behavior = update.get("behavior")?.as_str()?;
+                    if !matches!(behavior, "allow" | "deny" | "ask") {
+                        return None;
+                    }
+                    let rules = update.get("rules")?.as_array()?;
+                    let mut scopes = Vec::new();
+                    for rule in rules {
+                        if !rule
+                            .as_object()?
+                            .keys()
+                            .all(|key| matches!(key.as_str(), "toolName" | "ruleContent"))
+                        {
+                            return None;
+                        }
+                        let tool = serde_json::to_string(rule.get("toolName")?.as_str()?).ok()?;
+                        let scope = match rule.get("ruleContent") {
+                            Some(content) => format!("rule {}", serde_json::to_string(content.as_str()?).ok()?),
+                            None => "all inputs".to_owned(),
+                        };
+                        scopes.push(format!("{tool}: {scope}"));
+                    }
+                    let scope = if scopes.is_empty() {
+                        "empty rule list".to_owned()
+                    } else {
+                        scopes.join("; ")
+                    };
+                    let verb = match action {
+                        "addRules" => "Add",
+                        "replaceRules" => "Replace",
+                        _ => "Remove",
+                    };
+                    (
+                        &["type", "destination", "behavior", "rules"],
+                        format!("{verb} {behavior} rules in {destination}: {scope}"),
+                    )
+                }
+                "setMode" => {
+                    let mode = update.get("mode")?.as_str()?;
+                    if !is_valid_claude_permission_mode(mode) {
+                        return None;
+                    }
+                    (
+                        &["type", "destination", "mode"],
+                        format!("Set permission mode to {mode} in {destination}"),
+                    )
+                }
+                "addDirectories" | "removeDirectories" => {
+                    let directories = update.get("directories")?.as_array()?;
+                    let mut paths = Vec::new();
+                    for path in directories {
+                        paths.push(serde_json::to_string(path.as_str()?).ok()?);
+                    }
+                    let scope = if paths.is_empty() {
+                        "empty directory list".to_owned()
+                    } else {
+                        paths.join("; ")
+                    };
+                    let verb = if action == "addDirectories" { "Add" } else { "Remove" };
+                    (
+                        &["type", "destination", "directories"],
+                        format!("{verb} directories in {destination}: {scope}"),
+                    )
+                }
+                _ => return None,
+            };
+            if !object.keys().all(|key| allowed_keys.contains(&key.as_str())) {
+                return None;
+            }
+            details.push(format!("{}. {detail}", index + 1));
+        }
+        Some(details.join("\n"))
+    }
+
+    pub fn suggestion_option(&self) -> Option<(String, String)> {
+        use base64::Engine as _;
+        if self.suppress_always_allow_rule {
+            return None;
+        }
+        self.suggestion_details()?;
+        let exact = serde_json::to_string(self.permission_suggestions.as_ref()?).ok()?;
+        // The opaque choice is bound to the entire exact bundle. Do not decode
+        // client data into updates: answer validation compares to the pending set.
+        let id = format!(
+            "claude_allow_suggestions:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(exact.as_bytes())
+        );
+        Some((id, "Allow this call and apply the listed permission changes".to_owned()))
+    }
+
+    pub fn accepts_suggestion(&self, selected: Option<&str>) -> bool {
+        self.suggestion_option()
+            .is_some_and(|(id, _)| selected == Some(id.as_str()))
+    }
+}
+
+// decision_reason may contain ANSI (SDKControlPermissionRequest). Strip CSI/OSC
+// and other controls for display; never modify the pending tool input or rules.
+fn permission_text(text: &str) -> String {
+    let mut output = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' || (c == '\u{1b}' && chars.next() == Some('\\')) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        } else if !ch.is_control() || matches!(ch, '\n' | '\t') {
+            output.push(ch);
+        }
+    }
+    output
+}
+
 /// The claude backend adapter. Feature 004: ONE instance per persistent
 /// SESSION (not per turn). `buf` (the NDJSON half-line buffer) persists across
 /// turns/result spans — the persistent process's stdout does not EOF between
@@ -980,12 +1184,9 @@ impl ClaudeAdapter {
                     request_id: request_id.to_string(),
                     // 007 §9.17: claude can_use_tool is a TOOL approval (not auth).
                     kind: crate::event::PermissionKind::Tool,
-                    // G3 auto-approval is ACP-only; no team-MCP approval flows here, so
-                    // no allowlist context to carry. (Under the production `default`
-                    // permission mode, claude raises can_use_tool for routine tools too
-                    // — Write/Bash PROMPT, LIVE 2.1.191 — not only AskUserQuestion; this
-                    // arm correctly surfaces a Permission for ANY can_use_tool.)
-                    metadata: None,
+                    // Namespaced native hints do not populate ACP's server_name /
+                    // options auto-approval context. Tool input remains untouched.
+                    metadata: request.map(|r| ClaudePermissionContext::from_request(r).metadata()),
                     tool_name,
                     input,
                 }]
@@ -3068,17 +3269,44 @@ mod tests {
                 "subtype": "can_use_tool",
                 "tool_name": "Bash",
                 "tool_use_id": "toolu-b1",
+                "decision_reason": "\u{1b}[31mNative safety check\u{1b}[0m",
+                "permission_suggestions": [{"type":"addRules","rules":[{"toolName":"Bash","ruleContent":"ls:*"}],"behavior":"allow","destination":"session"}],
+                "suppress_always_allow_rule": true,
+                "default_to_no": true,
                 "input": { "command": "rm -rf /" }
             }
         });
         let events = ClaudeAdapter::new().parse_control_request(&frame);
         match events.as_slice() {
-            [SessionEvent::Permission { tool_name, input, .. }] => {
+            [
+                SessionEvent::Permission {
+                    tool_name,
+                    input,
+                    metadata,
+                    ..
+                },
+            ] => {
                 assert_eq!(tool_name.as_deref(), Some("Bash"));
                 let input = input.as_ref().expect("ordinary tool input is projected for the card");
                 assert_eq!(
                     input["command"], "rm -rf /",
                     "the command body reaches the permission card so the user reviews it"
+                );
+                let hints = ClaudePermissionContext::from_metadata(metadata.as_ref()).unwrap();
+                assert_eq!(hints.decision_reason.as_deref(), Some("Native safety check"));
+                assert_eq!(
+                    hints.permission_suggestions.as_ref(),
+                    frame["request"].get("permission_suggestions")
+                );
+                assert!(hints.suppress_always_allow_rule && hints.default_to_no);
+                assert!(
+                    hints.suggestion_option().is_none(),
+                    "native suppression overrides suggestions"
+                );
+                assert!(metadata.as_ref().unwrap().get("server_name").is_none());
+                assert!(
+                    metadata.as_ref().unwrap().get("options").is_none(),
+                    "no ACP auto-approval metadata"
                 );
             }
             other => panic!("expected one Permission, got {other:?}"),
