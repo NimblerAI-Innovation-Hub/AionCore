@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "assetlens/**"]
   pull_request:
-    branches: [main]
+    branches: [main, "assetlens/**"]
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,6 +20,9 @@ jobs:
           fetch-depth: 0
       - run: bash scripts/migration/check-immutability.test.sh
       - run: bash scripts/migration/check-immutability.sh
+        env:
+          # Compare a pull request against its own base, so release-line PRs check against the release line.
+          AIONCORE_MIGRATION_BASE_REF: ${{ github.base_ref && format('origin/{0}', github.base_ref) || 'origin/main' }}
 
   fmt:
     name: Format
