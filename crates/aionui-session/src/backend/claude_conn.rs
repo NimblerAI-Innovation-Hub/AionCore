@@ -1499,7 +1499,12 @@ fn build_control_response(
     use super::types::PermissionDecision;
     use serde_json::json;
     let allow = matches!(decision, PermissionDecision::Approved | PermissionDecision::AllowAlways);
-    if decision == PermissionDecision::AllowAlways && !pending.permission.accepts_suggestion(selected) {
+    // AskUserQuestion answers never carry updatedPermissions, so a legacy Always
+    // on a question still records the answer, as before native scopes existed.
+    if decision == PermissionDecision::AllowAlways
+        && pending.tool_name != "AskUserQuestion"
+        && !pending.permission.accepts_suggestion(selected)
+    {
         return Err(BackendError::Transport(
             "native permission scope is unavailable or stale; choose a current option".into(),
         ));
@@ -6159,6 +6164,15 @@ mod tests {
         // Denied ignores the label entirely → deny body.
         let denied = build_control_response("req-1", &pending, PermissionDecision::Denied, Some("Beta"), &[]).unwrap();
         assert_eq!(denied["response"]["response"]["behavior"], "deny");
+
+        // A legacy Always on a question still answers it and grants no rule.
+        let always = build_control_response("req-1", &pending, PermissionDecision::AllowAlways, Some("Beta"), &[])
+            .expect("legacy Always on a question is answered, not refused");
+        assert_eq!(
+            always["response"]["response"]["updatedInput"]["answers"]["Pick one"],
+            "Beta"
+        );
+        assert!(always["response"]["response"].get("updatedPermissions").is_none());
     }
 
     /// Task #83 (load-bearing): claude can ask MULTIPLE questions in one call and a
