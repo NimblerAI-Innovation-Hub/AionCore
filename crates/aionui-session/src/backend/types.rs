@@ -174,8 +174,8 @@ pub struct QuestionAnswer {
 /// Read-only snapshot of ONE currently-open (unanswered) permission request, for
 /// REST recovery (`GET /confirmations`) of a reloaded `waiting_confirmation`
 /// conversation. Transient adapter-side state — NOT reducer/FSM/persisted. Carries
-/// only the safe correlation + title surface (`request_id`/`tool_name`); the raw
-/// tool `input` (command body / args) is deliberately NOT exposed (TIO-13).
+/// correlation, title and native approval hints for the approver; the raw tool
+/// `input` (command body / args) is deliberately NOT exposed (TIO-13).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingPermissionView {
     /// The control correlation key (claude `request_id`); the recovery card's
@@ -193,6 +193,10 @@ pub struct PendingPermissionView {
     /// AskUserQuestion carries `input` from the adapter, so this is `None` for every
     /// ordinary tool.
     pub questions: Option<serde_json::Value>,
+    /// Backend-owned permission hints, symmetric with SessionEvent::Permission.
+    /// Claude uses a separate `claude` namespace, never ACP auto-approval fields.
+    /// Display to the approver only; do not log reasons or suggested scopes.
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Per-command metadata (§C1). `client_msg_id` is the pending-queue correlation

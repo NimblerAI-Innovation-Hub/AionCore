@@ -1044,6 +1044,7 @@ impl SessionBackend for AntigravitySessionBackend {
                 // agy has no AskUserQuestion equivalent: every hook request is a
                 // plain allow/deny on a tool.
                 questions: None,
+                metadata: None,
             })
             .collect()
     }
