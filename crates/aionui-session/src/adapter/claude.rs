@@ -107,9 +107,9 @@ impl ClaudePermissionContext {
                         {
                             return None;
                         }
-                        let tool = serde_json::to_string(rule.get("toolName")?.as_str()?).ok()?;
+                        let tool = display_quote(rule.get("toolName")?.as_str()?);
                         let scope = match rule.get("ruleContent") {
-                            Some(content) => format!("rule {}", serde_json::to_string(content.as_str()?).ok()?),
+                            Some(content) => format!("rule {}", display_quote(content.as_str()?)),
                             None => "all inputs".to_owned(),
                         };
                         scopes.push(format!("{tool}: {scope}"));
@@ -143,7 +143,7 @@ impl ClaudePermissionContext {
                     let directories = update.get("directories")?.as_array()?;
                     let mut paths = Vec::new();
                     for path in directories {
-                        paths.push(serde_json::to_string(path.as_str()?).ok()?);
+                        paths.push(display_quote(path.as_str()?));
                     }
                     let scope = if paths.is_empty() {
                         "empty directory list".to_owned()
@@ -188,8 +188,41 @@ impl ClaudePermissionContext {
     }
 }
 
-// decision_reason may contain ANSI (SDKControlPermissionRequest). Strip CSI/OSC
-// and other controls for display; never modify the pending tool input or rules.
+/// Zero-width and bidirectional formatting characters render invisibly or reorder
+/// neighbouring text, so a rule or path containing them could read as a narrower
+/// scope than the one actually granted.
+fn is_invisible_format(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}'..='\u{202E}'
+            | '\u{2060}'..='\u{2069}'
+            | '\u{FEFF}'
+    )
+}
+
+/// JSON-quote a rule or directory for display, additionally escaping invisible
+/// and bidi formatting characters as visible `\u{..}` sequences. Display only:
+/// the native bundle returned to Claude is never rewritten.
+fn display_quote(text: &str) -> String {
+    let quoted = serde_json::to_string(text).unwrap_or_default();
+    let mut output = String::with_capacity(quoted.len());
+    for ch in quoted.chars() {
+        if is_invisible_format(ch) {
+            output.push_str(&format!("\\u{{{:04X}}}", ch as u32));
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+// decision_reason may contain ANSI (SDKControlPermissionRequest). Strip CSI/OSC,
+// other controls and invisible bidi/zero-width formatting for display; never
+// modify the pending tool input or rules.
 fn permission_text(text: &str) -> String {
     let mut output = String::new();
     let mut chars = text.chars().peekable();
@@ -212,7 +245,7 @@ fn permission_text(text: &str) -> String {
                 }
                 _ => {}
             }
-        } else if !ch.is_control() || matches!(ch, '\n' | '\t') {
+        } else if (!ch.is_control() && !is_invisible_format(ch)) || matches!(ch, '\n' | '\t') {
             output.push(ch);
         }
     }
@@ -3612,5 +3645,31 @@ mod tests {
             },
             other => panic!("expected one ToolResult, got {other:?}"),
         }
+    }
+
+    /// A rule or path carrying bidi/zero-width characters must not read as a
+    /// different scope on the card, and the bundle returned to Claude stays exact.
+    #[test]
+    fn permission_scope_display_exposes_invisible_formatting() {
+        let rule = "ls\u{202E}*:\u{200B}";
+        let bundle = json!([
+            {"type":"addRules","rules":[{"toolName":"Bash","ruleContent":rule}],"behavior":"allow","destination":"session"},
+            {"type":"addDirectories","directories":["/work\u{2066}space"],"destination":"session"}
+        ]);
+        let hints = ClaudePermissionContext::from_request(&json!({
+            "decision_reason": "Run\u{202E} ls",
+            "permission_suggestions": bundle.clone()
+        }));
+        let description = hints.description();
+        assert!(description.contains(r#"rule "ls\u{202E}*:\u{200B}""#), "{description}");
+        assert!(description.contains(r#""/work\u{2066}space""#), "{description}");
+        assert!(description.starts_with("Run ls\n"), "{description}");
+        assert!(!description.chars().any(is_invisible_format));
+        assert_eq!(
+            hints.permission_suggestions,
+            Some(bundle),
+            "native bundle is not rewritten"
+        );
+        assert!(hints.suggestion_option().is_some());
     }
 }
